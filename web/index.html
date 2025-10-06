@@ -1,0 +1,80 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>SNODAS Snowmelt (NOHRSC/NSIDC)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
+  <link href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet"/>
+  <style>
+    body, html, #map { margin:0; padding:0; height:100%; }
+    .ctrl { position:absolute; z-index:2; background:#fff; padding:8px; margin:8px; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.2); font-family:sans-serif }
+    .legend { position:absolute; right:8px; bottom:8px; background:#fff; padding:8px; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.2); }
+    .legend .bar { height:10px; width:220px; background: linear-gradient(90deg, #0000ff, #00ffff, #00ff00, #ffff00, #ff7f00, #ff0000); }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div class="ctrl">
+  <div><b>Snowmelt layers</b></div>
+  <label><input type="radio" name="lyr" value="m24_tomorrow" checked/> 24-h ending Tomorrow</label><br/>
+  <label><input type="radio" name="lyr" value="m24_nextday"/> 24-h ending Day-after-Tomorrow</label><br/>
+  <label><input type="radio" name="lyr" value="m72_tomorrow"/> 72-h ending Tomorrow</label><br/>
+  <label><input type="radio" name="lyr" value="m72_nextday"/> 72-h ending Day-after-Tomorrow</label>
+</div>
+<div class="legend">
+  <div><b>Snowmelt (m per period)</b></div>
+  <div class="bar"></div>
+  <div style="display:flex; justify-content:space-between; font-size:12px;">
+    <span>0</span><span>0.005</span><span>0.01</span><span>0.02</span><span>0.05</span><span>0.1+</span>
+  </div>
+</div>
+<script>
+  mapboxgl.accessToken = (new URLSearchParams(location.search).get('mb') || 'YOUR_MAPBOX_TOKEN_HERE');
+  const map = new mapboxgl.Map({
+    container: 'map',
+    style: 'mapbox://styles/mapbox/light-v11',
+    center: [-96.8, 49.5],
+    zoom: 3.2
+  });
+
+  function yyyymmdd(d){
+    const y = d.getFullYear();
+    const m = (d.getMonth()+1).toString().padStart(2,'0');
+    const day = d.getDate().toString().padStart(2,'0');
+    return `${y}${m}${day}`;
+  }
+
+  const now = new Date();
+  const tomorrow = new Date(now); tomorrow.setDate(now.getDate()+1);
+  const nextday = new Date(now); nextday.setDate(now.getDate()+2);
+
+  const D1 = yyyymmdd(tomorrow);
+  const D2 = yyyymmdd(nextday);
+
+  const layers = [
+    { id:'m24_tomorrow', type:'raster', tiles:[`/tiles/24h/${D1}/{z}/{x}/{y}.png`], minzoom:0, maxzoom:14, opacity:0.85 },
+    { id:'m24_nextday',  type:'raster', tiles:[`/tiles/24h/${D2}/{z}/{x}/{y}.png`], minzoom:0, maxzoom:14, opacity:0.85 },
+    { id:'m72_tomorrow', type:'raster', tiles:[`/tiles/72h/${D1}/{z}/{x}/{y}.png`], minzoom:0, maxzoom:14, opacity:0.85 },
+    { id:'m72_nextday',  type:'raster', tiles:[`/tiles/72h/${D2}/{z}/{x}/{y}.png`], minzoom:0, maxzoom:14, opacity:0.85 },
+  ];
+
+  function showOnly(id){
+    layers.forEach(l => map.setLayoutProperty(l.id, 'visibility', l.id===id?'visible':'none'));
+  }
+
+  map.on('load', () => {
+    layers.forEach(l => {
+      if (!map.getSource(l.id)) {
+        map.addSource(l.id, { type:'raster', tiles:l.tiles, tileSize:256 });
+        map.addLayer({ id:l.id, type:'raster', source:l.id, paint:{ 'raster-opacity': l.opacity } });
+      }
+    });
+    showOnly('m24_tomorrow');
+    document.querySelectorAll('input[name="lyr"]').forEach(r => {
+      r.addEventListener('change', (e)=> showOnly(e.target.value));
+    });
+  });
+</script>
+</body>
+</html>
