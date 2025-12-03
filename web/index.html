@@ -1,80 +1,261 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <title>SNODAS Snowmelt (NOHRSC/NSIDC)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
-  <link href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet"/>
+  <meta charset="utf-8">
+  <title>SNODAS 24-Hour Snowmelt + CN Railway</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Mapbox GL -->
+  <link href="https://cdn.jsdelivr.net/npm/mapbox-gl@3.15.0/dist/mapbox-gl.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/mapbox-gl@3.15.0/dist/mapbox-gl.js"></script>
+
+  <!-- Favicon (silence 404) -->
+  <link rel="icon" href="data:image/x-icon;base64,iVBORw0KGgo=">
+
   <style>
-    body, html, #map { margin:0; padding:0; height:100%; }
-    .ctrl { position:absolute; z-index:2; background:#fff; padding:8px; margin:8px; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.2); font-family:sans-serif }
-    .legend { position:absolute; right:8px; bottom:8px; background:#fff; padding:8px; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.2); }
-    .legend .bar { height:10px; width:220px; background: linear-gradient(90deg, #0000ff, #00ffff, #00ff00, #ffff00, #ff7f00, #ff0000); }
+    html,body{margin:0;height:100%}
+    #map{position:fixed;inset:0}
+    .panel{
+      position:absolute;right:12px;bottom:12px;z-index:3;
+      background:rgba(255,255,255,.88);padding:10px 12px;border-radius:8px;
+      font:14px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+      box-shadow:0 4px 14px rgba(0,0,0,.18);
+    }
+    #err{
+      position:fixed;left:0;right:0;top:0;z-index:9999;
+      background:#ffebe9;color:#4d0000;padding:8px 12px;
+      font:13px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+      display:none;border-bottom:1px solid #ffc1c1;
+    }
+    .badge{display:inline-block;padding:2px 6px;border-radius:6px;background:#eee;margin-left:6px;font-size:12px}
+    label{display:block;font-size:13px;margin-top:4px}
   </style>
+
+  <!-- Exposes window.__SNODAS_CONFIG__.MAPBOX_TOKEN if set in env -->
+  <script src="/config.js"></script>
 </head>
 <body>
-<div id="map"></div>
-<div class="ctrl">
-  <div><b>Snowmelt layers</b></div>
-  <label><input type="radio" name="lyr" value="m24_tomorrow" checked/> 24-h ending Tomorrow</label><br/>
-  <label><input type="radio" name="lyr" value="m24_nextday"/> 24-h ending Day-after-Tomorrow</label><br/>
-  <label><input type="radio" name="lyr" value="m72_tomorrow"/> 72-h ending Tomorrow</label><br/>
-  <label><input type="radio" name="lyr" value="m72_nextday"/> 72-h ending Day-after-Tomorrow</label>
-</div>
-<div class="legend">
-  <div><b>Snowmelt (m per period)</b></div>
-  <div class="bar"></div>
-  <div style="display:flex; justify-content:space-between; font-size:12px;">
-    <span>0</span><span>0.005</span><span>0.01</span><span>0.02</span><span>0.05</span><span>0.1+</span>
+  <div id="err"></div>
+  <div id="map"></div>
+
+  <div class="panel">
+    <div style="margin-bottom:6px">
+      <strong>SNODAS Snowmelt</strong>
+      <span id="when" class="badge">Loading…</span>
+    </div>
+    <div>
+      <label><input type="radio" name="layer" value="daily" checked> Daily (NSIDC)</label>
+      <label><input type="radio" name="layer" value="forecast"> Forecast (latest available)</label>
+    </div>
+    <div style="font-size:12px;color:#333;margin-top:6px">
+      <span style="color:#e00">━━ CN Railway</span>
+    </div>
   </div>
-</div>
-<script>
-  mapboxgl.accessToken = (new URLSearchParams(location.search).get('mb') || 'YOUR_MAPBOX_TOKEN_HERE');
-  const map = new mapboxgl.Map({
-    container: 'map',
-    style: 'mapbox://styles/mapbox/light-v11',
-    center: [-96.8, 49.5],
-    zoom: 3.2
-  });
 
-  function yyyymmdd(d){
-    const y = d.getFullYear();
-    const m = (d.getMonth()+1).toString().padStart(2,'0');
-    const day = d.getDate().toString().padStart(2,'0');
-    return `${y}${m}${day}`;
-  }
-
-  const now = new Date();
-  const tomorrow = new Date(now); tomorrow.setDate(now.getDate()+1);
-  const nextday = new Date(now); nextday.setDate(now.getDate()+2);
-
-  const D1 = yyyymmdd(tomorrow);
-  const D2 = yyyymmdd(nextday);
-
-  const layers = [
-    { id:'m24_tomorrow', type:'raster', tiles:[`/tiles/24h/${D1}/{z}/{x}/{y}.png`], minzoom:0, maxzoom:14, opacity:0.85 },
-    { id:'m24_nextday',  type:'raster', tiles:[`/tiles/24h/${D2}/{z}/{x}/{y}.png`], minzoom:0, maxzoom:14, opacity:0.85 },
-    { id:'m72_tomorrow', type:'raster', tiles:[`/tiles/72h/${D1}/{z}/{x}/{y}.png`], minzoom:0, maxzoom:14, opacity:0.85 },
-    { id:'m72_nextday',  type:'raster', tiles:[`/tiles/72h/${D2}/{z}/{x}/{y}.png`], minzoom:0, maxzoom:14, opacity:0.85 },
-  ];
-
-  function showOnly(id){
-    layers.forEach(l => map.setLayoutProperty(l.id, 'visibility', l.id===id?'visible':'none'));
-  }
-
-  map.on('load', () => {
-    layers.forEach(l => {
-      if (!map.getSource(l.id)) {
-        map.addSource(l.id, { type:'raster', tiles:l.tiles, tileSize:256 });
-        map.addLayer({ id:l.id, type:'raster', source:l.id, paint:{ 'raster-opacity': l.opacity } });
+  <script>
+  (function(){
+    function showErr(msg){
+      const el = document.getElementById('err');
+      el.textContent = String(msg);
+      el.style.display = 'block';
+      console.error(msg);
+    }
+    function setWhenLabel(txt){
+      document.getElementById('when').textContent = txt;
+    }
+    function setDailyEnabled(enabled){
+      const el = document.querySelector('input[name="layer"][value="daily"]');
+      if (el) el.disabled = !enabled;
+      if (!enabled) {
+        const sel = document.querySelector('input[name="layer"]:checked');
+        if (sel && sel.value === 'daily') {
+          const f = document.querySelector('input[name="layer"][value="forecast"]');
+          if (f) f.checked = true;
+        }
       }
-    });
-    showOnly('m24_tomorrow');
-    document.querySelectorAll('input[name="lyr"]').forEach(r => {
-      r.addEventListener('change', (e)=> showOnly(e.target.value));
-    });
-  });
-</script>
+    }
+    try{
+      if (!window.mapboxgl) {
+        showErr('Mapbox GL failed to load (mapbox-gl.js). Check network tab.');
+        return;
+      }
+      // Mapbox token: env via /config.js, then ?mb=, then (optional) hardcoded fallback
+      let token = '';
+      try { token = (window.__SNODAS_CONFIG__ && window.__SNODAS_CONFIG__.MAPBOX_TOKEN) || ''; } catch(e){}
+      if (!token) {
+        const qs = new URLSearchParams(location.search);
+        token = qs.get('mb') || '';
+      }
+      if (!token) {
+        // optional fallback (ok to leave blank in prod)
+        token = 'pk.eyJ1IjoianNpbm93aXR6IiwiYSI6ImNtZ2dhMjI1bDAzaWYya29laWJrcDVkeGMifQ.JkmIsFePm8ja5hYRn21BLg';
+      }
+      if (!token) {
+        showErr('Missing Mapbox token. Set MAPBOX_TOKEN env (via /config.js) or pass ?mb=...');
+        return;
+      }
+      mapboxgl.accessToken = token;
+      const map = new mapboxgl.Map({
+        container: 'map',
+        style: 'mapbox://styles/mapbox/satellite-streets-v12',
+        center: [-100, 55],
+        zoom: 4
+      });
+      map.on('error', (e)=>{
+        const msg = (e && e.error && e.error.message) || (e && e.error) || 'unknown';
+        showErr('Map error: ' + msg);
+      });
+      // ---------- Layer builders ----------
+      function addForecast(){
+        if (map.getSource('melt-forecast')) {
+          try { map.removeLayer('melt-forecast'); } catch(e){}
+          try { map.removeSource('melt-forecast'); } catch(e){}
+        }
+        map.addSource('melt-forecast', {
+          type: 'raster',
+          // server chooses a working ts_key and falls back automatically
+          tiles: ['https://jsinowitz-snodas-melt.hf.space/tiles/forecast/latest/{z}/{x}/{y}.png?max=0.05'],
+          tileSize: 256,
+          maxzoom: 14
+        });
+        map.addLayer({
+          id: 'melt-forecast',
+          type: 'raster',
+          source: 'melt-forecast',
+          paint: { 'raster-opacity': 0.85 },
+          layout: { 'visibility': 'none' }
+        });
+      }
+      function addDailyTiles(){
+        if (map.getSource('melt-daily')) {
+          try { map.removeLayer('melt-daily'); } catch(e){}
+          try { map.removeSource('melt-daily'); } catch(e){}
+        }
+        map.addSource('melt-daily', {
+          type: 'raster',
+          tiles: ['https://jsinowitz-snodas-melt.hf.space/tiles/24h/latest/{z}/{x}/{y}.png?max=0.05'],
+          tileSize: 256
+        });
+        map.addLayer({
+          id: 'melt-daily',
+          type: 'raster',
+          source: 'melt-daily',
+          paint: { 'raster-opacity': 0.85 },
+          layout: { 'visibility': 'visible' }
+        });
+      }
+      function addCn(){
+        const url = '/web/cn_tracks.geojson';
+        if (map.getSource('cn')) {
+          try { map.removeLayer('cn'); } catch(e){}
+          try { map.removeSource('cn'); } catch(e){}
+        }
+        fetch(url, {cache:'no-cache'})
+          .then(r=>{ if(!r.ok) throw new Error('CN geojson HTTP '+r.status); return r.json(); })
+          .then(geojson=>{
+            map.addSource('cn', { type: 'geojson', data: geojson });
+            map.addLayer({
+              id: 'cn',
+              type: 'line',
+              source: 'cn',
+              paint: { 'line-color': '#ff0000', 'line-width': 2 }
+            });
+          })
+          .catch(err=>showErr('CN track load failed: ' + err));
+      }
+      function showOnlyLayer(id){
+        ['melt-daily','melt-forecast'].forEach(l=>{
+          if (map.getLayer(l)) {
+            map.setLayoutProperty(l, 'visibility', l===id ? 'visible' : 'none');
+          }
+        });
+      }
+      // ---------- Backend helpers for labels ----------
+      // Fetch and display the latest forecast ts_key for the badge
+      function refreshForecastWhenLabel(){
+        fetch('https://jsinowitz-snodas-melt.hf.space/forecast/latest_ts', {cache:'no-cache'})
+          .then(r=>r.ok ? r.json() : Promise.reject(r.status))
+          .then(j=>{
+            const ts = j && j.last_available_ts_key;
+            if (ts && /^\d{10}$/.test(ts)) {
+              const lbl = `Forecast ending ${ts.slice(0,4)}-${ts.slice(4,6)}-${ts.slice(6,8)} ${ts.slice(8,10)}Z`;
+              const selected = document.querySelector('input[name="layer"]:checked')?.value;
+              if (selected === 'forecast') setWhenLabel(lbl);
+              // store for later toggles
+              window.__SNODAS_LAST_TS__ = ts;
+            }
+          })
+          .catch(()=>{ /* non-fatal */ });
+      }
+      // Only add daily layer if backend confirms availability
+      function initDailyLayerOrFallback(){
+        fetch('https://jsinowitz-snodas-melt.hf.space/meta/latest', {cache:'no-cache'})
+          .then(r=>r.json())
+          .then(j=>{
+            if (j && j.available && j.date) {
+              addDailyTiles();
+              setDailyEnabled(true);
+              setWhenLabel('Daily ' + j.date);
+              showOnlyLayer('melt-daily');
+            } else {
+              setDailyEnabled(false);
+              setWhenLabel('Daily unavailable — showing Forecast');
+              showOnlyLayer('melt-forecast');
+            }
+          })
+          .catch(()=>{
+            setDailyEnabled(false);
+            setWhenLabel('Daily status unknown — showing Forecast');
+            showOnlyLayer('melt-forecast');
+          });
+      }
+      // ---------- Map load ----------
+      map.on('load', ()=>{
+        try {
+          addForecast();                 // forecast (server auto-picks latest)
+          addCn();                       // CN overlay
+          initDailyLayerOrFallback();    // daily if available
+          refreshForecastWhenLabel();    // get latest forecast key for the badge
+        } catch (e) {
+          showErr('Layer init error: ' + e);
+        }
+        // Layer toggle
+        document.querySelectorAll('input[name="layer"]').forEach(r=>{
+          r.addEventListener('change', e=>{
+            const v = e.target.value;
+            if (v === 'forecast') {
+              showOnlyLayer('melt-forecast');
+              const ts = window.__SNODAS_LAST_TS__;
+              if (ts && /^\d{10}$/.test(ts)) {
+                setWhenLabel(`Forecast ending ${ts.slice(0,4)}-${ts.slice(4,6)}-${ts.slice(6,8)} ${ts.slice(8,10)}Z`);
+              } else {
+                setWhenLabel('Forecast (latest available)');
+                // try to update in the background
+                refreshForecastWhenLabel();
+              }
+            } else {
+              const dailyEnabled = !document.querySelector('input[value="daily"]').disabled;
+              if (dailyEnabled) {
+                showOnlyLayer('melt-daily');
+                // Ask backend again in case “latest day” advanced
+                fetch('https://jsinowitz-snodas-melt.hf.space/meta/latest', {cache:'no-cache'})
+                  .then(r=>r.json())
+                  .then(j=> setWhenLabel(j && j.date ? ('Daily ' + j.date) : 'Daily (latest)'))
+                  .catch(()=> setWhenLabel('Daily (latest)'));
+              } else {
+                // keep forecast visible
+                const f = document.querySelector('input[value="forecast"]');
+                if (f) f.checked = true;
+                showOnlyLayer('melt-forecast');
+              }
+            }
+          });
+        });
+      });
+    } catch(e){
+      showErr('Boot error: ' + e);
+    }
+  })();
+  </script>
 </body>
 </html>
