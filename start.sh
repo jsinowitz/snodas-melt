@@ -1,30 +1,50 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# safe startup: never die before uvicorn
+set -u                       # (no -e; allow prefetch to fail without aborting)
+set -o pipefail
 
-# Optional: choose how many days to cache (D1=tomorrow, D2=day-after)
-export PREFETCH_DAYS="2"   # we’ll prebuild 24h+72h ending for the next 2 days
+PYTHON=/opt/conda/envs/snodas/bin/python
+UVICORN=/opt/conda/envs/snodas/bin/uvicorn
 
-python - << 'PY'
+# ---- Non-fatal prefetch (today..today-3) ----
+"$PYTHON" - <<'PY' || true
 import datetime as dt
-import os, sys
-from server import build_24h_cog, build_72h_cog
+import requests
+import sys
+try:
+    from server import build_24h_cog, nsidc_daily_tar_url
+except Exception as e:
+    print(f"Prefetch import warning: {e}", file=sys.stderr)
+else:
+    def first_available(dates):
+        for d in dates:
+            try:
+                url = nsidc_daily_tar_url(d)build_72h_cog(d)
+                r = requests.head(url, timeout=30, allow_redirects=True)
+                if r.status_code == 200:
+                    return d
+            except Exception:
+                pass
+        return None
 
-# Dates: “tomorrow” and “day after tomorrow” in UTC calendar terms
-today = dt.date.today()
-dates = [today + dt.timedelta(days=1), today + dt.timedelta(days=2)]
+    utc_today = dt.date.today()
+    candidates = [utc_today,
+                  utc_today - dt.timedelta(days=1),
+                  utc_today - dt.timedelta(days=2),
+                  utc_today - dt.timedelta(days=3)]
 
-print("Prefetching SNODAS melt COGs...")
-for d in dates:
-    try:
-        print("  24h:", d)
-        build_24h_cog(d)
-        print("  72h:", d)
-        build_72h_cog(d)
-    except Exception as e:
-        print("Prefetch warning for", d, "->", e, file=sys.stderr)
-
-print("Prefetch done.")
+    avail = first_available(candidates)
+    if avail is None:
+        print("Prefetch: no available SNODAS day yet (today..today-3). Will build on first tile request.")
+    else:
+        print(f"Prefetch: building 24h COG for {avail}")
+        try:
+            build_24h_cog(avail)
+        except Exception as e:
+            print(f"Prefetch warning for {avail} -> {e}", file=sys.stderr)
+# Always exit 0 so startup continues
+sys.exit(0)
 PY
 
-# Launch the API
-exec uvicorn server:app --host 0.0.0.0 --port 8000
+# ---- Run API (always) ----
+exec "$UVICORN" server:app --host 0.0.0.0 --port 8000
