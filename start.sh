@@ -19,7 +19,7 @@ else:
     def first_available(dates):
         for d in dates:
             try:
-                url = nsidc_daily_tar_url(d)build_72h_cog(d)
+                url = nsidc_daily_tar_url(d)
                 r = requests.head(url, timeout=30, allow_redirects=True)
                 if r.status_code == 200:
                     return d
