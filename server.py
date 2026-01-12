@@ -37,7 +37,7 @@ SCHEDULE_HOUR_LOCAL = int(os.environ.get("SCHEDULE_HOUR_LOCAL", "7"))  # 7am loc
 SCHEDULE_MIN_LOCAL = int(os.environ.get("SCHEDULE_MIN_LOCAL", "0"))
 
 WARM_ZMIN = int(os.environ.get("WARM_ZMIN", "6"))
-WARM_ZMAX = int(os.environ.get("WARM_ZMAX", "9"))
+WARM_ZMAX = int(os.environ.get("WARM_ZMAX", "10"))
 WARM_RADIUS = int(os.environ.get("WARM_RADIUS", "1"))
 WARM_CAP_PER_ZOOM = int(os.environ.get("WARM_CAP_PER_ZOOM", "6000"))
 WARM_MAX_TILES_TOTAL = int(os.environ.get("WARM_MAX_TILES_TOTAL", "40000"))
@@ -596,28 +596,28 @@ def _hf_pull_cache() -> None:
         return
 
     try:
+        allow_patterns = [
+            "forecast/**",
+            "tilecache/**",
+            "melt24h_*_cog.tif",
+            "melt72h_end_*_cog.tif",
+        ]
         snapshot_download(
             repo_id=repo,
             repo_type="dataset",
             token=tok,
             local_dir=str(CACHE),
             local_dir_use_symlinks=False,
+            allow_patterns=allow_patterns,
             resume_download=True,
-            allow_patterns=[
-                "tilecache/**",
-                "forecast/**",
-                "melt24h_*_cog.tif",
-                "melt72h_end_*_cog.tif",
-            ],
         )
     except Exception as e:
-        _log("WARN", f"[hf] snapshot_download failed err={e!r}")
+        _log("WARN", f"[hf] snapshot_download failed err={e}")
         return
 
-    # Clean up accidental LFS pointer files or tiny junk PNGs
     try:
         removed = 0
-        for p in CACHE.rglob("*.png"):
+        for p in (CACHE / "tilecache").rglob("*.png"):
             try:
                 b = p.read_bytes()
                 if _is_lfs_pointer_bytes(b) or p.stat().st_size < 200:
@@ -674,73 +674,86 @@ def _hf_commit_with_backoff(ops: list, message: str) -> None:
                 continue
             raise
 
-def _hf_push_tilecache_for_window(window_ymds: list[str], dom: str, hours_list: list[int]) -> dict:
+_TILE_Z_RE = re.compile(r"_z(\d+)_")
+
+def _hf_push_tilecache_for_window(
+    window: list[str],
+    dom: str,
+    hours_list: list[int],
+    zmin: int | None = None,
+    zmax: int | None = None,
+) -> dict:
     tok, repo = _hf_cfg()
     api = _hf_api()
     if not tok or not repo or api is None:
-        return {"ok": False, "skipped": True, "reason": "hf_not_configured"}
-
-    root = _tile_cache_dir()
-    if not root.exists():
-        return {"ok": True, "pushed": 0, "ops": 0}
+        return {"ok": False, "error": "hf_not_configured"}
 
     dom = (dom or "zz").lower()
-    want_ymds = set(window_ymds)
+    root = _tile_cache_dir()
+    if not root.exists():
+        return {"ok": True, "pushed": 0, "skipped": 0}
+
+    want_dates = set(window)
     want_hours = set(int(h) for h in hours_list)
 
-    # Collect candidate pngs
-    files: list[Path] = []
+    ops: list[CommitOperationAdd] = []
+    pushed = 0
+    skipped = 0
+
     for p in root.rglob("bydate_*.png"):
-        try:
-            n = p.name
-            m = re.search(r"bydate_([a-z0-9]+)_h([0-9]+)_([0-9]{8})_z", n)
-            if not m:
-                continue
-            p_dom = m.group(1)
-            p_h = int(m.group(2))
-            p_ymd = m.group(3)
-            if p_dom != dom:
-                continue
-            if p_h not in want_hours:
-                continue
-            if p_ymd not in want_ymds:
-                continue
-            if p.stat().st_size <= 0:
-                continue
-            files.append(p)
-        except Exception:
+        name = p.name
+
+        m = re.match(r"^bydate_([a-z0-9]+)_h(\d+)_(\d{8})_z\d+_\d+_\d+\.png$", name)
+        if not m:
             continue
 
-    if not files:
-        return {"ok": True, "pushed": 0, "ops": 0}
+        f_dom = m.group(1)
+        f_hours = int(m.group(2))
+        f_ymd = m.group(3)
 
-    # Build ops in chunks to avoid massive commits
-    pushed = 0
-    ops_total = 0
-    files.sort(key=lambda p: p.name)
+        if f_dom != dom or f_hours not in want_hours or f_ymd not in want_dates:
+            continue
 
-    i = 0
-    while i < len(files):
-        chunk = files[i : i + HF_MAX_OPS_PER_COMMIT]
-        ops = []
-        for p in chunk:
-            try:
-                rel = p.relative_to(CACHE).as_posix()
-                if not _is_cache_file_we_manage(rel):
-                    continue
-                ops.append(CommitOperationAdd(path_in_repo=rel, path_or_fileobj=p.as_posix()))
-            except Exception:
-                continue
+        mz = _TILE_Z_RE.search(name)
+        z = int(mz.group(1)) if mz else None
+        if z is not None and zmin is not None and z < int(zmin):
+            continue
+        if z is not None and zmax is not None and z > int(zmax):
+            continue
 
-        if ops:
-            _hf_commit_with_backoff(ops, message=f"tilecache: update dom={dom} files={len(ops)}")
+        if not _is_valid_png_file(p):
+            skipped += 1
+            continue
+        
+
+        rel = f"tilecache/{name}"
+        ops.append(CommitOperationAdd(path_in_repo=rel, path_or_fileobj=p.as_posix()))
+
+        if len(ops) >= int(HF_MAX_OPS_PER_COMMIT):
+            api.create_commit(
+                repo_id=repo,
+                repo_type="dataset",
+                token=tok,
+                operations=ops,
+                commit_message=f"tilecache: update dom={dom} files={len(ops)}",
+            )
             pushed += len(ops)
-            ops_total += len(ops)
+            ops = []
+            if HF_PUSH_SLEEP_SEC > 0:
+                time.sleep(float(HF_PUSH_SLEEP_SEC))
 
-        i += HF_MAX_OPS_PER_COMMIT
+    if ops:
+        api.create_commit(
+            repo_id=repo,
+            repo_type="dataset",
+            token=tok,
+            operations=ops,
+            commit_message=f"tilecache: update dom={dom} files={len(ops)}",
+        )
+        pushed += len(ops)
 
-    _log("INFO", f"[hf_cache] tilecache push OK dom={dom} files={pushed}")
-    return {"ok": True, "pushed": pushed, "ops": ops_total}
+    return {"ok": True, "pushed": pushed, "skipped": skipped, "dom": dom}
+
 
 def _hf_push_files(paths: list[Path]) -> None:
     tok, repo = _hf_cfg()
@@ -822,13 +835,23 @@ def _yyyymmdd(d) -> str:
     return d.strftime("%Y%m%d")
     
 def _track_geojson_path() -> Optional[Path]:
-    p1 = Path("web") / "cn_tracks.geojson"
-    if p1.exists():
-        return p1
-    p2 = Path(__file__).resolve().parent / "web" / "cn_tracks.geojson"
-    if p2.exists():
-        return p2
+    candidates = [
+        Path("web") / "cn_tracks.geojson",
+        Path("web") / "cn_tracks_src.geojson",
+        Path("web") / "cn_tracks_src.geojson".with_suffix(".geojson"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+
+    base = Path(__file__).resolve().parent / "web"
+    for name in ("cn_tracks.geojson", "cn_tracks_src.geojson"):
+        p = base / name
+        if p.exists():
+            return p
+
     return None
+
 
 def _load_track_points(max_points: int = 35000) -> list[tuple[float, float]]:
     p = _track_geojson_path()
@@ -926,7 +949,7 @@ def _prewarm_cn_corridor_tiles(
     hours: int = 24,
     dom: str = "zz",
     zmin: int = 6,
-    zmax: int = 9,
+    zmax: int = 10,
     radius: int = 1,
     cap_per_zoom: int = 6000,
     max_tiles_total: int = 20000,
@@ -2637,9 +2660,42 @@ def _bake_lowres_box_tiles_for_date(
 ) -> dict:
     dom = (dom or "zz").lower()
 
+    # Same boxes used by _tile_allowed()
+    box_a = (-170.0, 49.0, -40.0, 90.0)  # (w,s,e,n)
+    box_b = (-97.0, 37.0, -63.0, 49.0)   # (w,s,e,n)
+    boxes = [box_a, box_b]
+
+    def lon2tile(lon: float, z: int) -> int:
+        return int(np.floor(((lon + 180.0) / 360.0) * (1 << int(z))))
+
+    def lat2tile(lat: float, z: int) -> int:
+        lat = max(min(float(lat), 85.05112878), -85.05112878)
+        r = np.deg2rad(lat)
+        n = np.log(np.tan(np.pi / 4.0 + r / 2.0))
+        return int(np.floor((1.0 - n / np.pi) / 2.0 * (1 << int(z))))
+
     tiles: list[tuple[int, int, int]] = []
     for z in range(int(zmin), int(zmax) + 1):
-        tiles.extend(_tiles_in_allowed_boxes(z))
+        n = (1 << int(z)) - 1
+        seen = set()
+
+        for (w, s, e, nlat) in boxes:
+            x0 = max(0, min(n, lon2tile(w, z)))
+            x1 = max(0, min(n, lon2tile(e, z)))
+            y0 = max(0, min(n, lat2tile(nlat, z)))  # north -> smaller y
+            y1 = max(0, min(n, lat2tile(s, z)))     # south -> larger y
+
+            xmin, xmax = (x0, x1) if x0 <= x1 else (x1, x0)
+            ymin, ymax = (y0, y1) if y0 <= y1 else (y1, y0)
+
+            for x in range(xmin, xmax + 1):
+                for y in range(ymin, ymax + 1):
+                    # Final safety: real intersection test (matches _tile_allowed semantics)
+                    tb = _tile_bounds(z, x, y)
+                    if _box_intersects(tb, box_a) or _box_intersects(tb, box_b):
+                        seen.add((int(z), int(x), int(y)))
+
+        tiles.extend(sorted(seen))
 
     if not tiles:
         return {"ok": False, "error": "no_lowres_tiles"}
@@ -2647,7 +2703,7 @@ def _bake_lowres_box_tiles_for_date(
     q = deque()
     for hours in hours_list:
         for (z, x, y) in tiles:
-            q.append((int(hours), z, x, y))
+            q.append((int(hours), int(z), int(x), int(y)))
 
     ok = 0
     fail = 0
@@ -2694,6 +2750,7 @@ def _bake_lowres_box_tiles_for_date(
         "zmin": zmin,
         "zmax": zmax,
     }
+
 
 def _png(rgb: np.ndarray, a: np.ndarray) -> bytes:
     return render(rgb, mask=a.astype("uint8"), img_format="PNG")
@@ -3144,7 +3201,7 @@ def _run_daily_roll_job_once() -> dict:
 
     pushed_tiles = None
     try:
-        pushed_tiles = _hf_push_tilecache_for_window(window, WARM_DOM, WARM_HOURS_LIST)
+        pushed_tiles = _hf_push_tilecache_for_window(window, WARM_DOM, WARM_HOURS_LIST, zmin=WARM_ZMIN, zmax=WARM_ZMAX)
     except Exception as e:
         pushed_tiles = {"ok": False, "error": f"push_tilecache_exc:{e!r}"}
 
@@ -3793,7 +3850,7 @@ def __debug_prewarm_cn(
     hours: int = Query(24, ge=24, le=72),
     dom: str = Query("zz"),
     zmin: int = Query(6, ge=0, le=14),
-    zmax: int = Query(9, ge=0, le=14),
+    zmax: int = Query(10, ge=0, le=14),
     miles: float = Query(10.0, ge=0.0, le=50.0),
     cap_per_zoom: int = Query(6000, ge=100, le=20000),
     max_tiles_total: int = Query(20000, ge=100, le=100000),
@@ -3855,9 +3912,10 @@ def __debug_hf_status():
         files = api.list_repo_files(repo_id=repo, repo_type="dataset")
         out["repo_files_count"] = len(files)
         want = [
-            "tilecache/bydate_zz_h24_20260113_z11_353_693.png",
-            "tilecache/bydate_zz_h72_20260113_z11_353_693.png",
-            "forecast/fcst_melt72h_end_2026011305_zz_cog.tif",
+            # "tilecache/bydate_zz_h24_20260113_z11_353_693.png",
+            # "tilecache/bydate_zz_h72_20260113_z11_353_693.png",
+            # "forecast/fcst_melt72h_end_2026011305_zz_cog.tif",
+            "tilecache/bydate_zz_h24_20260111_z6_4_16.png",
         ]
         fset = set(files)
         out["samples"] = {k: (k in fset) for k in want}
