@@ -37,12 +37,12 @@ SCHEDULE_HOUR_LOCAL = int(os.environ.get("SCHEDULE_HOUR_LOCAL", "7"))  # 7am loc
 SCHEDULE_MIN_LOCAL = int(os.environ.get("SCHEDULE_MIN_LOCAL", "0"))
 
 WARM_ZMIN = int(os.environ.get("WARM_ZMIN", "6"))
-WARM_ZMAX = int(os.environ.get("WARM_ZMAX", "10"))
+WARM_ZMAX = int(os.environ.get("WARM_ZMAX", "12"))
 WARM_RADIUS = int(os.environ.get("WARM_RADIUS", "1"))
-WARM_CAP_PER_ZOOM = int(os.environ.get("WARM_CAP_PER_ZOOM", "6000"))
-WARM_MAX_TILES_TOTAL = int(os.environ.get("WARM_MAX_TILES_TOTAL", "40000"))
+WARM_CAP_PER_ZOOM = int(os.environ.get("WARM_CAP_PER_ZOOM", "7000"))
+WARM_MAX_TILES_TOTAL = int(os.environ.get("WARM_MAX_TILES_TOTAL", "50000"))
 WARM_DOM = os.environ.get("WARM_DOM", "zz").lower()
-WARM_MILES = float(os.environ.get("WARM_MILES", "10"))
+WARM_MILES = float(os.environ.get("WARM_MILES", "8"))
 # BOOT_ROLL_DEFAULT = os.environ.get("RUN_BOOT_ROLL", "1")
 BOOT_ROLL_DEFAULT = os.environ.get("RUN_BOOT_ROLL", "1")
 
@@ -148,9 +148,6 @@ _LOG = deque(maxlen=2000)
 TILE_CACHE_DIR = (CACHE / "tile_png_cache" / "forecast_by_date")
 TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-def _cog_sig(p: Path) -> str:
-    st = p.stat()
-    return f"{p.name}:{st.st_size}:{int(st.st_mtime)}"
 
 @lru_cache(maxsize=8000)
 def _tile_png_cached(sig: str, z: int, x: int, y: int, max_in: float | None) -> bytes:
@@ -168,8 +165,10 @@ def _lock(key: str) -> threading.Lock:
         return l
 
 def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> bytes | None:
+    """Try to get cached tile: 1) local disk, 2) HF repo. Returns None if not found."""
     p = _tile_cache_path(dom, hours, ymd, z, x, y)
 
+    # First check local cache
     try:
         if _is_valid_png_file(p):
             return p.read_bytes()
@@ -178,11 +177,13 @@ def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> b
     except Exception:
         pass
 
+    # Then try HF repo if enabled
     if not _hf_pull_on_miss_enabled():
         return None
 
     rel = p.relative_to(CACHE).as_posix()
-
+    
+    # Try to pull from HF
     if _hf_try_pull_file(rel):
         try:
             if _is_valid_png_file(p):
@@ -190,9 +191,12 @@ def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> b
             elif p.exists():
                 _safe_unlink(p)
         except Exception:
-            return None
+            pass
 
+    # Not found in either location
     return None
+
+
 
 def _tile_cache_put(dom: str, hours: int, ymd: str, z: int, x: int, y: int, png: bytes) -> None:
     p = _tile_cache_path(dom, hours, ymd, z, x, y)
@@ -234,6 +238,7 @@ def _generate_forecast_by_date_png_impl(
     dom: str,
     max_in: float | None,
 ) -> tuple[bytes, dict]:
+    """Generate forecast tile PNG. Builds COGs on-demand if needed."""
     dom = (dom or "zz").lower()
     valid = _norm_ts(f"{date_yyyymmdd}05")
 
@@ -242,16 +247,30 @@ def _generate_forecast_by_date_png_impl(
         if not sel.get("ok"):
             detail = dict(sel)
             detail["collab_last"] = dict(_COLLAB_LAST)
+            detail["suggestion"] = "forecast data may not be available yet for this date"
             raise HTTPException(status_code=503, detail=detail)
 
-        # Build melt + snow mask, then render png
-        melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+        # Build melt + snow COGs (this will build on-demand if missing)
+        try:
+            melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+        except HTTPException as e:
+            # If melt COGs can't be built, surface a clearer error
+            raise HTTPException(
+                status_code=503, 
+                detail={
+                    "error": "melt_cogs_unavailable",
+                    "date": date_yyyymmdd,
+                    "hours": 24,
+                    "upstream_error": str(e.detail) if hasattr(e, 'detail') else str(e)
+                }
+            )
 
         snow = snow_valid = None
         snow_info = "snowpack_unavailable"
         if sel.get("snowpack_urls"):
             try:
-                snow, snow_valid, snow_info = _read_mask_tile(sel.get("snowpack_ts") or sel["valid"], sel["snowpack_urls"], z, x, y)
+                snow_cogs = _build_forecast_snowpack_cogs(sel.get("snowpack_ts") or sel["valid"], sel["snowpack_urls"])
+                snow, snow_valid, snow_info = _union_tile(snow_cogs, z, x, y, label="snowpack")
             except Exception as e:
                 snow_info = f"snowpack_unavailable:{e!r}"
 
@@ -289,12 +308,32 @@ def _generate_forecast_by_date_png_impl(
             "X-Forecast-Hours": "24",
         }
 
-    # 72h
+    # 72h path
     run_init = _pick_best_run_init_for_valid_t0024(valid, dom_prefer=dom)
     if not run_init:
-        raise HTTPException(status_code=503, detail={"error": "no_run_init_for_valid", "valid": valid, "dom": dom})
+        raise HTTPException(
+            status_code=503, 
+            detail={
+                "error": "no_run_init_for_valid", 
+                "valid": valid, 
+                "dom": dom,
+                "suggestion": "forecast data may not be available yet for this date"
+            }
+        )
 
-    melt72_cog = _forecast_melt72h_end_cog(valid, dom_prefer=dom)
+    try:
+        melt72_cog = _forecast_melt72h_end_cog(valid, dom_prefer=dom)
+    except HTTPException as e:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "melt72_cog_unavailable",
+                "date": date_yyyymmdd,
+                "hours": 72,
+                "upstream_error": str(e.detail) if hasattr(e, 'detail') else str(e)
+            }
+        )
+
     melt_mm, melt_mask, oob = _tile_arrays_from_cog(melt72_cog, z, x, y)
     if oob or melt_mm is None or melt_mask is None:
         return _transparent_png_256(), {
@@ -337,6 +376,8 @@ def _generate_forecast_by_date_png_impl(
         "X-Forecast-72h-COG": melt72_cog.name,
         "X-SnowPack-INFO": snow_info,
     }
+
+
 
 def _log(level: str, msg: str) -> None:
     _LOG.append({"ts": int(datetime.utcnow().timestamp() * 1000), "level": level, "msg": msg})
@@ -834,23 +875,33 @@ def _ts_to_dt(ts10: str) -> datetime:
 def _yyyymmdd(d) -> str:
     return d.strftime("%Y%m%d")
     
-def _track_geojson_path() -> Optional[Path]:
+# def _track_geojson_path() -> Optional[Path]:
+#     candidates = [
+#         Path("web") / "cn_tracks.geojson",
+#         Path("web") / "cn_tracks_src.geojson",
+#         Path("web") / "cn_tracks_src.geojson".with_suffix(".geojson"),
+#     ]
+#     for p in candidates:
+#         if p.exists():
+#             return p
+
+#     base = Path(__file__).resolve().parent / "web"
+#     for name in ("cn_tracks.geojson", "cn_tracks_src.geojson"):
+#         p = base / name
+#         if p.exists():
+#             return p
+
+#     return None
+def _track_geojson_path() -> Path:
     candidates = [
         Path("web") / "cn_tracks.geojson",
         Path("web") / "cn_tracks_src.geojson",
-        Path("web") / "cn_tracks_src.geojson".with_suffix(".geojson"),
+        Path("web") / "NTAD_North_American_Rail_Network_Lines_CN_-6165835494608975392.geojson",
     ]
     for p in candidates:
         if p.exists():
             return p
-
-    base = Path(__file__).resolve().parent / "web"
-    for name in ("cn_tracks.geojson", "cn_tracks_src.geojson"):
-        p = base / name
-        if p.exists():
-            return p
-
-    return None
+    return candidates[0]  # default
 
 
 def _load_track_points(max_points: int = 35000) -> list[tuple[float, float]]:
@@ -903,126 +954,6 @@ def _lonlat_to_tile(lon: float, lat: float, z: int) -> tuple[int, int]:
     x = max(0, min(n - 1, x))
     y = max(0, min(n - 1, y))
     return x, y
-
-def _tiles_near_points(points: list[tuple[float, float]], z: int, radius: int = 1, cap: int = 8000) -> list[tuple[int, int, int]]:
-    if not points:
-        return []
-    r = max(0, int(radius))
-    seen: set[tuple[int, int]] = set()
-    out: list[tuple[int, int, int]] = []
-    n = 2 ** int(z)
-
-    for lon, lat in points:
-        tx, ty = _lonlat_to_tile(lon, lat, z)
-        for dx in range(-r, r + 1):
-            for dy in range(-r, r + 1):
-                x = tx + dx
-                y = ty + dy
-                if x < 0 or y < 0 or x >= n or y >= n:
-                    continue
-                key = (x, y)
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append((z, x, y))
-                if len(out) >= cap:
-                    return out
-    return out
-
-def _prewarm_union_tile(cogs: list[Path], z: int, x: int, y: int) -> bool:
-    ok = False
-    for cog in sorted(cogs, key=lambda p: _dom_pri(_cog_dom(p))):
-        try:
-            with COGReader(cog.as_posix()) as r:
-                r.tile(x, y, z, tilesize=256, resampling_method="nearest")
-            ok = True
-            break
-        except TileOutsideBounds:
-            continue
-        except Exception:
-            continue
-    return ok
-
-def _prewarm_cn_corridor_tiles(
-    *,
-    days: int = 2,
-    hours: int = 24,
-    dom: str = "zz",
-    zmin: int = 6,
-    zmax: int = 10,
-    radius: int = 1,
-    cap_per_zoom: int = 6000,
-    max_tiles_total: int = 20000,
-) -> dict:
-    dom = (dom or "zz").lower()
-    pts = _load_track_points()
-    if not pts:
-        return {"ok": False, "error": "no_cn_points"}
-
-    now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    valid = _valid_ts_for_days(int(days), now_utc=now)
-
-    sel = _pick_forecast_for_valid(valid, dom_prefer=dom)
-    if not sel.get("ok"):
-        return {"ok": False, "error": "forecast_selection_failed", "detail": sel}
-
-    melt_cogs: list[Path] = []
-    snow_cogs: list[Path] = []
-
-    if int(hours) == 72:
-        melt72 = _forecast_melt72h_end_cog(sel["valid"], dom_prefer=dom)
-        melt_cogs = [melt72]
-        snow_urls = _find_fcst_11034_grib2_tt_ts(sel["run_init"], sel["valid"], dom_prefer=dom)
-        if snow_urls:
-            snow_cogs = _build_forecast_snowpack_cogs(sel["valid"], snow_urls)
-    else:
-        melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
-        snow_urls = _find_fcst_11034_grib2_tt_ts(sel["run_init"], sel["valid"], dom_prefer=dom)
-        if snow_urls:
-            snow_cogs = _build_forecast_snowpack_cogs(sel["valid"], snow_urls)
-
-    total = 0
-    warmed_melt = 0
-    warmed_snow = 0
-
-    for z in range(int(zmin), int(zmax) + 1):
-        tiles = _tiles_near_points(pts, z, radius=radius, cap=cap_per_zoom)
-        for (zz, x, y) in tiles:
-            if total >= int(max_tiles_total):
-                return {
-                    "ok": True,
-                    "stopped": "max_tiles_total",
-                    "total": total,
-                    "warmed_melt": warmed_melt,
-                    "warmed_snow": warmed_snow,
-                    "zmin": zmin,
-                    "zmax": zmax,
-                    "radius": radius,
-                    "days": days,
-                    "hours": hours,
-                    "valid": sel["valid"],
-                }
-
-            if _prewarm_union_tile(melt_cogs, zz, x, y):
-                warmed_melt += 1
-            if snow_cogs:
-                if _prewarm_union_tile(snow_cogs, zz, x, y):
-                    warmed_snow += 1
-            total += 1
-
-    return {
-        "ok": True,
-        "total": total,
-        "warmed_melt": warmed_melt,
-        "warmed_snow": warmed_snow,
-        "zmin": zmin,
-        "zmax": zmax,
-        "radius": radius,
-        "days": days,
-        "hours": hours,
-        "valid": sel["valid"],
-    }
-
 
 def _collab_dirlist(ttl_sec: float = 240.0) -> str:
     now = datetime.utcnow().timestamp()
@@ -1849,6 +1780,7 @@ def _is_probably_html(blob: bytes) -> bool:
 
 
 def _hf_try_pull_file(rel: str) -> bool:
+    """Try to pull a file from HF repo. Returns True if successful, False otherwise."""
     tok, repo = _hf_cfg()
     if not tok or not repo:
         return False
@@ -1870,7 +1802,11 @@ def _hf_try_pull_file(rel: str) -> bool:
             local_dir_use_symlinks=False,
         )
     except Exception as e:
-        _log("WARN", f"[hf] pull miss rel={rel} err={e}")
+        # Only log if it's NOT a simple 404 (expected for tiles that haven't been cached yet)
+        err_str = str(e).lower()
+        if "404" not in err_str and "not found" not in err_str:
+            _log("WARN", f"[hf] pull unexpected error rel={rel} err={e}")
+        # Don't log 404s - they're expected for tiles not yet cached
         return False
 
     try:
@@ -1888,7 +1824,7 @@ def _hf_try_pull_file(rel: str) -> bool:
                 dest.unlink(missing_ok=True)
             except Exception:
                 pass
-            _log("WARN", f"[hf] pulled LFS pointer / tiny file for {rel} ({len(b)} bytes); treating as miss")
+            # Don't log these either - LFS pointers are common for newly added files
             return False
 
         if p.resolve() != dest:
@@ -1901,6 +1837,7 @@ def _hf_try_pull_file(rel: str) -> bool:
     except Exception as e:
         _log("WARN", f"[hf] pull validate failed rel={rel} err={e}")
         return False
+        
 def _is_netcdf_bytes(blob: bytes) -> bool:
     if len(blob) >= 4 and blob[:3] == b"CDF" and blob[3] in (1, 2):
         return True
@@ -2338,48 +2275,81 @@ def _ensure_xy_transform(da: xr.DataArray) -> xr.DataArray:
 
 
 def _build_forecast_melt_cogs(run_init: str, valid: str, lead: str, melt_urls: list[str]) -> list[Path]:
+    """Build forecast melt COGs. Raises HTTPException if no usable COGs can be built."""
     run_init = _norm_ts(run_init)
     valid = _norm_ts(valid)
     lead = (lead or "").lower()
+    
+    if not melt_urls:
+        raise HTTPException(
+            status_code=502, 
+            detail=f"No melt URLs provided for run_init={run_init} valid={valid} lead={lead}"
+        )
+    
     dom2urls: dict[str, list[str]] = {}
     for u in melt_urls:
         dom2urls.setdefault(_dom_from_url(u), []).append(u)
 
     built: list[Path] = []
+    errors: list[str] = []
+    
     with _lock(f"melt_{lead}_{run_init}_{valid}"):
         for dom in sorted(dom2urls.keys(), key=_dom_pri):
             out = _forecast_melt_cog(run_init, valid, lead, dom)
+            
+            # Check if already exists
             if out.exists() and out.stat().st_size > 0:
                 built.append(out)
                 continue
+            
+            # Try to build from URLs
             last_err = None
             for url in dom2urls[dom]:
                 low = Path(url).name.lower()
                 if lead and lead not in low:
                     continue
+                    
                 with tempfile.TemporaryDirectory() as td:
                     try:
                         desc, _ = _download_url_to_grid(url, Path(td))
                         da = _open_grid(desc)
                         _da_to_cog(da, out)
-                        try: _hf_enqueue_files([out])
-                        except Exception: pass
+                        
+                        try: 
+                            _hf_enqueue_files([out])
+                        except Exception: 
+                            pass
 
                         if out.exists() and out.stat().st_size > 0:
                             _log("INFO", f"[build_forecast] melt OK run_init={run_init} valid={valid} lead={lead} dom={dom} url={url} -> {out.name}")
                             built.append(out)
                             break
-                        last_err = "empty COG"
+                            
+                        last_err = "empty COG after build"
                     except HTTPException as e:
                         last_err = f"{e.status_code} {e.detail}"
                     except Exception as e:
                         last_err = repr(e)
+            
             if out not in built:
-                _log("INFO", f"[build_forecast] melt FAIL run_init={run_init} valid={valid} lead={lead} dom={dom} last_err={last_err}")
-    if not built:
-        raise HTTPException(status_code=502, detail=f"No usable MELT field for run_init={run_init} valid={valid} lead={lead}")
-    return built
+                error_msg = f"dom={dom} last_err={last_err}"
+                errors.append(error_msg)
+                _log("WARN", f"[build_forecast] melt FAIL run_init={run_init} valid={valid} lead={lead} {error_msg}")
     
+    if not built:
+        raise HTTPException(
+            status_code=502, 
+            detail={
+                "error": "No usable MELT COGs could be built",
+                "run_init": run_init,
+                "valid": valid,
+                "lead": lead,
+                "attempted_domains": list(dom2urls.keys()),
+                "errors": errors[:5]  # Limit error details
+            }
+        )
+        
+    return built
 def _build_forecast_snowpack_cogs(ts: str, urls: list[str]) -> list[Path]:
     ts = _norm_ts(ts) if ts and _TS10.fullmatch(ts) else ts
     dom2urls: dict[str, list[str]] = {}
@@ -2617,38 +2587,6 @@ def _tiles_within_miles(points: list[tuple[float, float]], z: int, miles: float,
                     return out
     return out
 
-    
-def _tiles_in_allowed_boxes(z: int) -> list[tuple[int, int, int]]:
-    z = int(z)
-    n = 1 << z
-
-    box_a = (-170.0, 49.0, -40.0, 90.0)  # Canada north band
-    box_b = (-97.0, 37.0, -63.0, 49.0)   # southern band
-
-    def tile_range_for_box(box):
-        w, s, e, nlat = box
-        x0, y0 = _lonlat_to_tile(w, nlat, z)
-        x1, y1 = _lonlat_to_tile(e, s, z)
-        xa, xb = sorted((x0, x1))
-        ya, yb = sorted((y0, y1))
-        xa = max(0, min(n - 1, xa)); xb = max(0, min(n - 1, xb))
-        ya = max(0, min(n - 1, ya)); yb = max(0, min(n - 1, yb))
-        out = []
-        for xx in range(xa, xb + 1):
-            for yy in range(ya, yb + 1):
-                out.append((z, xx, yy))
-        return out
-
-    seen = set()
-    out = []
-    for t in tile_range_for_box(box_a) + tile_range_for_box(box_b):
-        _, x, y = t
-        if (x, y) in seen:
-            continue
-        seen.add((x, y))
-        out.append(t)
-    return out
-
 def _bake_lowres_box_tiles_for_date(
     *,
     date_yyyymmdd: str,
@@ -2711,26 +2649,35 @@ def _bake_lowres_box_tiles_for_date(
 
     def worker():
         nonlocal ok, fail
-        while True:
-            with lk:
-                if not q:
-                    return
-                hours, z, x, y = q.popleft()
-            try:
-                if _tile_cache_get(dom, hours, date_yyyymmdd, z, x, y) is not None:
+        # Disable HF pulls during baking - we're generating tiles, not pulling them
+        with _HfPullOnMiss(False):
+            while True:
+                with lk:
+                    if not q:
+                        return
+                    hours, z, x, y = q.popleft()
+                try:
+                    # Check if already exists locally (skip HF check)
+                    p = _tile_cache_path(dom, hours, date_yyyymmdd, z, x, y)
+                    if _is_valid_png_file(p):
+                        ok += 1
+                        continue
+                    
+                    # Generate the tile
+                    png, _ = _generate_forecast_by_date_png(
+                        z=z, x=x, y=y,
+                        date_yyyymmdd=date_yyyymmdd,
+                        hours=hours,
+                        dom=dom,
+                        max_in=None,
+                    )
+                    _tile_cache_put(dom, hours, date_yyyymmdd, z, x, y, png)
                     ok += 1
-                    continue
-                png, _ = _generate_forecast_by_date_png(
-                    z=z, x=x, y=y,
-                    date_yyyymmdd=date_yyyymmdd,
-                    hours=hours,
-                    dom=dom,
-                    max_in=None,
-                )
-                _tile_cache_put(dom, hours, date_yyyymmdd, z, x, y, png)
-                ok += 1
-            except Exception:
-                fail += 1
+                except Exception as e:
+                    # Log first few failures for debugging
+                    if fail < 5:
+                        _log("WARN", f"[bake_lowres] tile failed z={z} x={x} y={y} err={e!r}")
+                    fail += 1
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(int(conc))]
     for t in threads:
@@ -2750,7 +2697,6 @@ def _bake_lowres_box_tiles_for_date(
         "zmin": zmin,
         "zmax": zmax,
     }
-
 
 def _png(rgb: np.ndarray, a: np.ndarray) -> bytes:
     return render(rgb, mask=a.astype("uint8"), img_format="PNG")
@@ -3004,26 +2950,35 @@ def _bake_corridor_tiles_for_date(
 
     def worker():
         nonlocal ok, fail
-        while True:
-            with lk:
-                if not q:
-                    return
-                hours, z, x, y = q.popleft()
-            try:
-                if _tile_cache_get(dom, hours, date_yyyymmdd, z, x, y) is not None:
+        # Disable HF pulls during baking - we're generating tiles, not pulling them
+        with _HfPullOnMiss(False):
+            while True:
+                with lk:
+                    if not q:
+                        return
+                    hours, z, x, y = q.popleft()
+                try:
+                    # Check if already exists locally (skip HF check)
+                    p = _tile_cache_path(dom, hours, date_yyyymmdd, z, x, y)
+                    if _is_valid_png_file(p):
+                        ok += 1
+                        continue
+                    
+                    # Generate the tile
+                    png, _ = _generate_forecast_by_date_png(
+                        z=z, x=x, y=y,
+                        date_yyyymmdd=date_yyyymmdd,
+                        hours=hours,
+                        dom=dom,
+                        max_in=None,
+                    )
+                    _tile_cache_put(dom, hours, date_yyyymmdd, z, x, y, png)
                     ok += 1
-                    continue
-                png, _ = _generate_forecast_by_date_png(
-                    z=z, x=x, y=y,
-                    date_yyyymmdd=date_yyyymmdd,
-                    hours=hours,
-                    dom=dom,
-                    max_in=None,
-                )
-                _tile_cache_put(dom, hours, date_yyyymmdd, z, x, y, png)
-                ok += 1
-            except Exception:
-                fail += 1
+                except Exception as e:
+                    # Log first few failures for debugging
+                    if fail < 5:
+                        _log("WARN", f"[bake] tile failed z={z} x={x} y={y} err={e!r}")
+                    fail += 1
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(int(conc))]
     for t in threads:
@@ -3046,7 +3001,6 @@ def _bake_corridor_tiles_for_date(
         "cap_per_zoom": int(cap_per_zoom),
         "max_tiles_total": int(max_tiles_total),
     }
-
 
 def _rolling_dates_local_window(today_local: datetime.date | None = None, days: int = 5) -> list[str]:
     if today_local is None:
@@ -3255,12 +3209,6 @@ def _shift_ts(ts10: str, hours: int) -> str:
     dt = _ts_to_dt(_norm_ts(ts10)) + timedelta(hours=hours)
     return dt.strftime("%Y%m%d%H")
 
-def _forecast_melt_t0072_cog(run_init: str, valid: str, dom: str) -> Path:
-    run_init = _norm_ts(run_init)
-    valid = _norm_ts(valid)
-    dom = (dom or "zz").lower()
-    return _forecast_dir() / f"fcst_melt_t0072_{run_init}_{valid}_{dom}_cog.tif"
-
 def _union_point(cogs: list[Path], lon: float, lat: float) -> tuple[Optional[float], str]:
     if not cogs:
         return None, "no_cogs"
@@ -3460,7 +3408,12 @@ def tiles_forecast_latest(
     days: int = Query(2, ge=2, le=3),
     hours: int = Query(24, ge=24, le=72),
 ):
-    if not _tile_allowed(z, x, y):
+    """Serve latest forecast tiles. Fallback chain: HF repo -> local cache -> build on-demand."""
+    
+    # Effective tile resolution
+    z_eff, x_eff, y_eff, tier = _effective_request_tile(z, x, y)
+    
+    if tier == "none":
         return _resp_png(
             _transparent_png_256(),
             cache_control=CACHE_CONTROL_LATEST,
@@ -3471,12 +3424,16 @@ def tiles_forecast_latest(
     if not sel.get("ok"):
         detail = dict(sel)
         detail["collab_last"] = dict(_COLLAB_LAST)
+        detail["suggestion"] = "latest forecast may not be available yet"
         raise HTTPException(status_code=503, detail=detail)
 
     valid_ymd = (sel["valid"] or "")[:8]  # YYYYMMDD
+    
+    # Try cache first
     if max is None and valid_ymd:
         try:
-            hit = _tile_cache_get("zz", int(hours), f"fcstlatest_{int(days)}_{valid_ymd}", z, x, y)
+            # Use a special cache key for "latest" that includes the resolved date
+            hit = _tile_cache_get("zz", int(hours), valid_ymd, z_eff, x_eff, y_eff)
             if hit is not None:
                 return _resp_png(
                     hit,
@@ -3484,109 +3441,52 @@ def tiles_forecast_latest(
                     **{
                         "X-Route": "forecast-latest",
                         "X-Allowed": "1",
-                        "X-Cache": "tilecache-hit",
+                        "X-Cache": "hit",
                         "X-Forecast-Valid": sel["valid"],
                         "X-Forecast-Hours": str(int(hours)),
                         "X-Forecast-RunInit-TT": sel["run_init"],
+                        "X-Tier": tier,
                     },
                 )
         except Exception:
             pass
 
-    if int(hours) == 72:
-        melt72_cog = _forecast_melt72h_end_cog(sel["valid"], dom_prefer="zz")
-
-        melt_mm, melt_mask, oob = _tile_arrays_from_cog(melt72_cog, z, x, y)
-        if oob or melt_mm is None or melt_mask is None:
-            return _resp_png(
-                _transparent_png_256(),
-                cache_control=CACHE_CONTROL_LATEST,
-                **{
-                    "X-Route": "forecast-latest",
-                    "X-Allowed": "1",
-                    "X-OOB": "1",
-                    "X-Forecast-Hours": "72",
-                    "X-Forecast-Valid": sel["valid"],
-                    "X-Forecast-RunInit-TT": sel["run_init"],
-                    "X-Forecast-72h-COG": melt72_cog.name,
-                },
-            )
-
-        snow_urls = _find_fcst_11034_grib2_tt_ts(sel["run_init"], sel["valid"], dom_prefer="zz")
-        snow = snow_valid = None
-        snow_info = "snowpack_unavailable"
-        if snow_urls:
-            try:
-                snow_cogs = _build_forecast_snowpack_cogs(sel["valid"], snow_urls)
-                snow, snow_valid, snow_info = _union_tile(snow_cogs, z, x, y, label="snowpack")
-            except Exception as e:
-                snow_info = f"snowpack_unavailable:{e!r}"
-
-        png = _melt_to_png(
-            melt_mm,
-            melt_mask,
-            max,
-            snow,
-            snow_valid,
-            snow_allow_min_mm=0.0,
-            snow_underlay_min_mm=0.0001,
-            dilate_px=2,
-            bin_edges_in=BIN_EDGES_72H_IN,
+    # Generate on-demand
+    try:
+        png, headers = _generate_forecast_by_date_png(
+            z=z_eff,
+            x=x_eff,
+            y=y_eff,
+            date_yyyymmdd=valid_ymd,
+            hours=hours,
+            dom="zz",
+            max_in=max,
         )
-
+        
+        # Cache the result
         if max is None and valid_ymd:
             try:
-                _tile_cache_put("zz", 72, f"fcstlatest_{int(days)}_{valid_ymd}", z, x, y, png)
+                _tile_cache_put("zz", int(hours), valid_ymd, z_eff, x_eff, y_eff, png)
+                _hf_enqueue_files([_tile_cache_path("zz", int(hours), valid_ymd, z_eff, x_eff, y_eff)])
+                cache_status = "generated-and-cached"
             except Exception:
-                pass
-
+                cache_status = "generated-only"
+        else:
+            cache_status = "generated-no-cache"
+        
+        headers["X-Cache"] = cache_status
+        headers["X-Tier"] = tier
+        headers["X-Route"] = "forecast-latest"
+        
         return _resp_png(
             png,
             cache_control=CACHE_CONTROL_LATEST,
-            **{
-                "X-Route": "forecast-latest",
-                "X-Forecast-Hours": "72",
-                "X-Forecast-Valid": sel["valid"],
-                "X-Forecast-RunInit-TT": sel["run_init"],
-                "X-Forecast-72h-COG": melt72_cog.name,
-                "X-SnowPack-TS": sel["valid"],
-                "X-SnowPack-Info": snow_info,
-                "X-Allowed": "1",
-                "X-OOB": "0",
-                "X-Cache": ("tilecache-store" if max is None else "bypass-max"),
-            },
+            **headers,
         )
-
-    _log("INFO", f"[tiles] /tiles/forecast/latest days={days} tt={sel['run_init']} ts={sel['valid']} lead={sel['lead']}")
-    resp = _serve_forecast_tile(
-        sel["run_init"],
-        sel["valid"],
-        sel["lead"],
-        sel["melt_urls"],
-        sel.get("snowpack_ts") or "",
-        sel.get("snowpack_urls") or [],
-        z,
-        x,
-        y,
-        max,
-    )
-    resp.headers["X-Allowed"] = "1"
-    resp.headers["Cache-Control"] = CACHE_CONTROL_LATEST
-    resp.headers["X-Route"] = "forecast-latest"
-    resp.headers["X-Forecast-Hours"] = str(int(hours))
-
-    if max is None and valid_ymd:
-        try:
-            body = resp.body
-            if body:
-                _tile_cache_put("zz", int(hours), f"fcstlatest_{int(days)}_{valid_ymd}", z, x, y, body)
-                resp.headers["X-Cache"] = "tilecache-store"
-        except Exception:
-            pass
-    else:
-        resp.headers["X-Cache"] = "bypass-max"
-
-    return resp
+        
+    except HTTPException as e:
+        _log("WARN", f"[tiles] forecast/latest failed: {e.detail}")
+        raise
 
 @app.get("/value/forecast/by_date")
 def value_forecast_by_date(
@@ -3631,7 +3531,12 @@ def tiles_forecast_by_date(
     max: float | None = Query(None),
     dom: str = Query("zz"),
 ):
-    if not _tile_allowed(z, x, y):
+    """Serve forecast tiles by date. Fallback chain: HF repo -> local cache -> build on-demand."""
+    
+    # Effective tile resolution (handles low-res fallback for off-corridor tiles)
+    z_eff, x_eff, y_eff, tier = _effective_request_tile(z, x, y)
+    
+    if tier == "none":
         return _resp_png(
             _transparent_png_256(),
             cache_control=CACHE_CONTROL_BY_DATE,
@@ -3639,115 +3544,61 @@ def tiles_forecast_by_date(
         )
 
     dom = (dom or "zz").lower()
-    valid = _norm_ts(f"{date_yyyymmdd}05")
-
+    
+    # Try to get from cache (checks local, then HF)
     if max is None:
-        hit = _tile_cache_get(dom, int(hours), date_yyyymmdd, z, x, y)
+        hit = _tile_cache_get(dom, int(hours), date_yyyymmdd, z_eff, x_eff, y_eff)
         if hit is not None:
             return _resp_png(
                 hit,
                 cache_control=CACHE_CONTROL_BY_DATE,
-                **{"X-Route": "forecast-by-date", "X-Allowed": "1", "X-Cache": "tilecache-hit"},
+                **{
+                    "X-Route": "forecast-by-date", 
+                    "X-Allowed": "1", 
+                    "X-Cache": "hit",
+                    "X-Tier": tier,
+                    "X-Effective-Tile": f"{z_eff}/{x_eff}/{y_eff}"
+                },
             )
 
-    if int(hours) == 24:
-        sel = _pick_forecast_for_valid(valid, dom_prefer=dom)
-        if not sel.get("ok"):
-            detail = dict(sel)
-            detail["collab_last"] = dict(_COLLAB_LAST)
-            raise HTTPException(status_code=503, detail=detail)
-
-        resp = _serve_forecast_tile(
-            sel["run_init"],
-            sel["valid"],
-            "t0024",
-            sel["melt_urls"],
-            sel.get("snowpack_ts") or "",
-            sel.get("snowpack_urls") or [],
-            z,
-            x,
-            y,
-            max,
+    # Not in cache - generate on-demand
+    try:
+        png, headers = _generate_forecast_by_date_png(
+            z=z_eff,
+            x=x_eff,
+            y=y_eff,
+            date_yyyymmdd=date_yyyymmdd,
+            hours=hours,
+            dom=dom,
+            max_in=max,
         )
-        resp.headers["X-Allowed"] = "1"
-        resp.headers["X-Route"] = "forecast-by-date"
-        resp.headers["X-Forecast-Hours"] = "24"
-        resp.headers["Cache-Control"] = CACHE_CONTROL_BY_DATE
-
+        
+        # Cache the generated tile
         if max is None:
             try:
-                body = resp.body
-                if body:
-                    _tile_cache_put(dom, 24, date_yyyymmdd, z, x, y, body)
-                    resp.headers["X-Cache"] = "tilecache-store"
+                _tile_cache_put(dom, int(hours), date_yyyymmdd, z_eff, x_eff, y_eff, png)
+                # Enqueue for HF push (will be pushed in next flush)
+                _hf_enqueue_files([_tile_cache_path(dom, int(hours), date_yyyymmdd, z_eff, x_eff, y_eff)])
+                cache_status = "generated-and-cached"
             except Exception:
-                pass
-
-        return resp
-
-    run_init = _pick_best_run_init_for_valid_t0024(valid, dom_prefer=dom)
-    if not run_init:
-        raise HTTPException(status_code=503, detail={"error": "no_run_init_for_valid", "valid": valid, "dom": dom})
-
-    melt72_cog = _forecast_melt72h_end_cog(valid, dom_prefer=dom)
-
-    melt_mm, melt_mask, oob = _tile_arrays_from_cog(melt72_cog, z, x, y)
-    if oob or melt_mm is None or melt_mask is None:
+                cache_status = "generated-only"
+        else:
+            cache_status = "generated-no-cache-due-to-max"
+        
+        headers["X-Cache"] = cache_status
+        headers["X-Tier"] = tier
+        headers["X-Effective-Tile"] = f"{z_eff}/{x_eff}/{y_eff}"
+        
         return _resp_png(
-            _transparent_png_256(),
+            png,
             cache_control=CACHE_CONTROL_BY_DATE,
-            **{
-                "X-Route": "forecast-by-date",
-                "X-Allowed": "1",
-                "X-OOB": "1",
-                "X-Forecast-Hours": "72",
-                "X-Forecast-Valid": valid,
-                "X-Forecast-RunInit-TT": run_init,
-                "X-Forecast-72h-COG": melt72_cog.name,
-            },
+            **headers,
         )
-
-    snow_urls = _find_fcst_11034_grib2_tt_ts(run_init, valid, dom_prefer=dom)
-    snow = snow_valid = None
-    snow_info = "snowpack_unavailable"
-    if snow_urls:
-        try:
-            snow_cogs = _build_forecast_snowpack_cogs(valid, snow_urls)
-            snow, snow_valid, snow_info = _union_tile(snow_cogs, z, x, y, label="snowpack")
-        except Exception as e:
-            snow_info = f"snowpack_unavailable:{e!r}"
-
-    png = _melt_to_png(
-        melt_mm,
-        melt_mask,
-        max,
-        snow,
-        snow_valid,
-        snow_allow_min_mm=0.0,
-        snow_underlay_min_mm=0.0001,
-        dilate_px=2,
-        bin_edges_in=BIN_EDGES_72H_IN,
-    )
-
-    if max is None:
-        _tile_cache_put(dom, 72, date_yyyymmdd, z, x, y, png)
-
-    return _resp_png(
-        png,
-        cache_control=CACHE_CONTROL_BY_DATE,
-        **{
-            "X-Route": "forecast-by-date",
-            "X-Forecast-Hours": "72",
-            "X-Forecast-Valid": valid,
-            "X-Forecast-RunInit-TT": run_init,
-            "X-Forecast-72h-COG": melt72_cog.name,
-            "X-SnowPack-TS": valid,
-            "X-SnowPack-INFO": snow_info,
-            "X-Allowed": "1",
-            "X-OOB": "0",
-            "X-Cache": ("tilecache-store" if max is None else "bypass-max"),
-        },
-    )
+        
+    except HTTPException as e:
+        # Return error details to help with debugging
+        _log("WARN", f"[tiles] forecast/by_date failed: {e.detail}")
+        raise
 
 @app.get("/tiles/forecast/{ts_key:regex(\\d{8}(?:[_-]?\\d{2}))}/{z}/{x}/{y}.png")
 def tiles_forecast(
@@ -3850,7 +3701,7 @@ def __debug_prewarm_cn(
     hours: int = Query(24, ge=24, le=72),
     dom: str = Query("zz"),
     zmin: int = Query(6, ge=0, le=14),
-    zmax: int = Query(10, ge=0, le=14),
+    zmax: int = Query(12, ge=0, le=14),
     miles: float = Query(10.0, ge=0.0, le=50.0),
     cap_per_zoom: int = Query(6000, ge=100, le=20000),
     max_tiles_total: int = Query(20000, ge=100, le=100000),
