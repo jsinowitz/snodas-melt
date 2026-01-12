@@ -151,16 +151,22 @@
   const valCache=new Map(),inflight=new Set();
   function showErr(msg){errBox.style.display="block";errBox.textContent=msg}
   function z2(n){return(n<10?"0":"")+n}
+
   const token=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.MAPBOX_TOKEN)||"";
   if(!token){showErr("Missing MAPBOX_TOKEN. Check /config.js and server environment.");return}
   mapboxgl.accessToken=token;
+
   const map=new mapboxgl.Map({container:"map",style:"mapbox://styles/mapbox/satellite-streets-v12",center:[-112.5,44.5],zoom:5});
   if(typeof map.isPitching!=="function")map.isPitching=()=>false;
   if(typeof map.isRotating!=="function")map.isRotating=()=>false;
-  console.log("mapboxgl version:",mapboxgl.version);
+
   const VALUE_BASE=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.VALUE_BASE)||window.location.origin;
   const CURSOR_ZMIN = 8;
   const PREFETCH_ZMIN = 7;
+
+  const HF_DATASET_REPO=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.HF_DATASET_REPO)||"Jsinowitz/snodas-snowmelt-cache";
+  const HF_TILE_BASE=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.HF_TILE_BASE)||("https://huggingface.co/datasets/"+HF_DATASET_REPO+"/resolve/main");
+  const USE_HF_TILES = true;
 
   function muteRoads(map){
     const style=map.getStyle(); if(!style||!style.layers)return;
@@ -189,7 +195,20 @@
     const xmin=Math.min(x0,x1),xmax=Math.max(x0,x1),ymin=Math.min(y0,y1),ymax=Math.max(y0,y1);
     return{xmin,xmax,ymin,ymax}
   }
-  function tileUrl(z,x,y,ymd,hours){return`/tiles/forecast/by_date/${z}/${x}/${y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`}
+
+  function hfTileUrlTemplate(ymd,hours,dom){
+    dom=(dom||"zz").toLowerCase();
+    return HF_TILE_BASE+`/tilecache/bydate_${dom}_h${hours}_${ymd}_z{z}_{x}_{y}.png`;
+  }
+
+  function tileUrl(z,x,y,ymd,hours){
+    if(USE_HF_TILES){
+      const u=hfTileUrlTemplate(ymd,hours,DOM);
+      return u.replace("{z}", String(z)).replace("{x}", String(x)).replace("{y}", String(y));
+    }
+    return `/tiles/forecast/by_date/${z}/${x}/${y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`;
+  }
+
   function makeQueue(limit){
     let active=0;const q=[];
     const run=()=>{while(active<limit&&q.length){const fn=q.shift();active++;Promise.resolve().then(fn).catch(()=>{}).finally(()=>{active--;run()})}};
@@ -206,10 +225,10 @@
     cursorPrefetchPush.clear();
     const step=QUANT_DEG,N=5,urls=[];
     for(let i=1;i<=N;i++){
-      urls.push(`/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon+step*i}&lat=${qLat}&dom=${DOM}`);
-      urls.push(`/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon-step*i}&lat=${qLat}&dom=${DOM}`);
-      urls.push(`/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon}&lat=${qLat+step*i}&dom=${DOM}`);
-      urls.push(`/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon}&lat=${qLat-step*i}&dom=${DOM}`);
+      urls.push(`${VALUE_BASE}/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon+step*i}&lat=${qLat}&dom=${DOM}`);
+      urls.push(`${VALUE_BASE}/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon-step*i}&lat=${qLat}&dom=${DOM}`);
+      urls.push(`${VALUE_BASE}/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon}&lat=${qLat+step*i}&dom=${DOM}`);
+      urls.push(`${VALUE_BASE}/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon}&lat=${qLat-step*i}&dom=${DOM}`);
     }
     for(const u of urls)cursorPrefetchPush(async()=>{if(myGen!==ringGen)return;try{await fetch(u,{cache:"force-cache",signal:ringAbort.signal})}catch{}})
   }
@@ -218,23 +237,23 @@
   const prefetched=new Set();
 
   function prefetchViewportTiles() {
-  if (map.getZoom() < PREFETCH_ZMIN) return;
-  const ymd = selectedDateYMD();
-  if (!ymd) return;
-  const hours = getHours();
-  const z0 = Math.max(0, Math.floor(map.getZoom()));
-  const maxZ = Math.min(14, z0 + 3);
-  const b = map.getBounds();
-  for (let z = z0 + 1; z <= maxZ; z++) {
-    const r = tileRangeForBounds(b, z);
-    for (let x = r.xmin; x <= r.xmax; x++) for (let y = r.ymin; y <= r.ymax; y++) {
-      const u = tileUrl(z, x, y, ymd, hours);
-      if (prefetched.has(u)) continue;
-      prefetched.add(u);
-      prefetchPush(() => fetch(u, { cache: "force-cache" }));
+    if (map.getZoom() < PREFETCH_ZMIN) return;
+    const ymd = selectedDateYMD();
+    if (!ymd) return;
+    const hours = getHours();
+    const z0 = Math.max(0, Math.floor(map.getZoom()));
+    const maxZ = Math.min(14, z0 + 3);
+    const b = map.getBounds();
+    for (let z = z0 + 1; z <= maxZ; z++) {
+      const r = tileRangeForBounds(b, z);
+      for (let x = r.xmin; x <= r.xmax; x++) for (let y = r.ymin; y <= r.ymax; y++) {
+        const u = tileUrl(z, x, y, ymd, hours);
+        if (prefetched.has(u)) continue;
+        prefetched.add(u);
+        prefetchPush(() => fetch(u, { cache: "force-cache" }));
+      }
     }
   }
-}
 
   function debounce(fn,ms){let t=0;return()=>{clearTimeout(t);t=setTimeout(fn,ms)}}
   const prefetchDebounced=debounce(prefetchViewportTiles,250);
@@ -242,92 +261,34 @@
   map.on("load",()=>muteRoads(map));
   map.on("styledata",()=>muteRoads(map));
 
-  const CN_SRC="cn_tracks_src",CN_LINE_GLOW="cn_tracks_line_glow",CN_LINE="cn_tracks_line";
+  const CN_SRC="cn_tracks_src",CN_LINE_GLOW="cn_tracks_src_line_glow",CN_LINE="cn_tracks_src_line";
   const LAYER_ID="melt_layer",SRC_ID="melt_src";
-  
+
   const LEGENDS = {
     "24": {
       colors: [
-        "#dcdcdc",
-        "#990000",
-        "#cc3333",
-        "#ff6666",
-        "#cccc66",
-        "#ff8c00",
-        "#ffff66",
-        "#99ff99",
-        "#00ff00",
-        "#66cc66",
-        "#6666ff",
-        "#3333cc",
-        "#000099",
-        "#990099",
-        "#4b0082",
-        "#2f004f",
-        "#000000"
+        "#dcdcdc","#990000","#cc3333","#ff6666","#cccc66","#ff8c00","#ffff66","#99ff99","#00ff00",
+        "#66cc66","#6666ff","#3333cc","#000099","#990099","#4b0082","#2f004f","#000000"
       ],
       labels: [
-        "0.00 to trace",
-        "trace to 0.02",
-        "0.02 to 0.04",
-        "0.04 to 0.08",
-        "0.08 to 0.12",
-        "0.12 to 0.16",
-        "0.16 to 0.20",
-        "0.20 to 0.39",
-        "0.39 to 0.59",
-        "0.59 to 0.79",
-        "0.79 to 0.98",
-        "0.98 to 1.4",
-        "1.4 to 2.0",
-        "2.0 to 3.0",
-        "3.0 to 4.0",
-        "4.0 to 5.0",
-        "> 5.0"
+        "0.00 to trace","trace to 0.02","0.02 to 0.04","0.04 to 0.08","0.08 to 0.12","0.12 to 0.16",
+        "0.16 to 0.20","0.20 to 0.39","0.39 to 0.59","0.59 to 0.79","0.79 to 0.98","0.98 to 1.4",
+        "1.4 to 2.0","2.0 to 3.0","3.0 to 4.0","4.0 to 5.0","> 5.0"
       ]
     },
     "72": {
       colors: [
-        "#dcdcdc",
-        "#990000",
-        "#cc3333",
-        "#ff6666",
-        "#cccc66",
-        "#ff8c00",
-        "#ffff66",
-        "#99ff99",
-        "#00ff00",
-        "#66cc66",
-        "#6666ff",
-        "#3333cc",
-        "#000099",
-        "#990099",
-        "#4b0082",
-        "#2f004f",
-        "#000000"
+        "#dcdcdc","#990000","#cc3333","#ff6666","#cccc66","#ff8c00","#ffff66","#99ff99","#00ff00",
+        "#66cc66","#6666ff","#3333cc","#000099","#990099","#4b0082","#2f004f","#000000"
       ],
       labels: [
-        "0.00 to trace",
-        "trace to 0.04",
-        "0.04 to 0.08",
-        "0.08 to 0.16",
-        "0.16 to 0.24",
-        "0.24 to 0.31",
-        "0.31 to 0.39",
-        "0.39 to 0.79",
-        "0.79 to 1.4",
-        "1.4 to 2.0",
-        "2.0 to 3.0",
-        "3.0 to 3.9",
-        "3.9 to 5.0",
-        "5.0 to 6.5",
-        "6.5 to 8.0",
-        "8.0 to 9.8",
-        "> 9.8"
+        "0.00 to trace","trace to 0.04","0.04 to 0.08","0.08 to 0.16","0.16 to 0.24","0.24 to 0.31",
+        "0.31 to 0.39","0.39 to 0.79","0.79 to 1.4","1.4 to 2.0","2.0 to 3.0","3.0 to 3.9",
+        "3.9 to 5.0","5.0 to 6.5","6.5 to 8.0","8.0 to 9.8","> 9.8"
       ]
     }
   };
-  
+
   function renderLegend(hours){
     const L=LEGENDS[String(hours)]||LEGENDS["24"];
     legendGrid.innerHTML="";
@@ -369,7 +330,11 @@
     const ymd=selectedDateYMD(),hours=getHours(); if(!ymd)return;
     subtitle.textContent=subtitleText(ymd,hours);
     renderLegend(hours);
-    const tiles=[`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`];
+
+    const tiles = USE_HF_TILES
+      ? [hfTileUrlTemplate(ymd,hours,DOM)]
+      : [`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`];
+
     cursorEl.style.display="none";lastKey="";reqId++;valCache.clear();inflight.clear();
     if(ringAbort){try{ringAbort.abort()}catch{}}
     cursorPrefetchPush.clear();ringCenterKey="";
@@ -437,7 +402,7 @@
   }
 
   async function loadAvailable(){
-    const r=await fetch("/forecast/available_days?lookback_days=5",{cache:"no-store"});
+    const r=await fetch(`${VALUE_BASE}/forecast/available_days?lookback_days=5`,{cache:"no-store"});
     if(!r.ok)throw new Error(`forecast/available_days -> HTTP ${r.status}`);
     const j=await r.json();
     available=(j&&j.available_dates?j.available_dates:[]).slice();
