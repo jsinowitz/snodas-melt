@@ -159,6 +159,8 @@
   if(typeof map.isRotating!=="function")map.isRotating=()=>false;
   console.log("mapboxgl version:",mapboxgl.version);
   const VALUE_BASE=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.VALUE_BASE)||window.location.origin;
+  const CURSOR_ZMIN = 8;
+  const PREFETCH_ZMIN = 7;
 
   function muteRoads(map){
     const style=map.getStyle(); if(!style||!style.layers)return;
@@ -215,19 +217,24 @@
   const prefetchPush=makeQueue(10),cursorPrefetchPush=makeQueue(16);
   const prefetched=new Set();
 
-  function prefetchViewportTiles(){
-    const ymd=selectedDateYMD(); if(!ymd)return;
-    const hours=getHours(),z0=Math.max(0,Math.floor(map.getZoom())),maxZ=Math.min(14,z0+3),b=map.getBounds();
-    for(let z=z0+1;z<=maxZ;z++){
-      const r=tileRangeForBounds(b,z);
-      for(let x=r.xmin;x<=r.xmax;x++)for(let y=r.ymin;y<=r.ymax;y++){
-        const u=tileUrl(z,x,y,ymd,hours);
-        if(prefetched.has(u))continue;
-        prefetched.add(u);
-        prefetchPush(()=>fetch(u,{cache:"force-cache"}));
-      }
+  function prefetchViewportTiles() {
+  if (map.getZoom() < PREFETCH_ZMIN) return;
+  const ymd = selectedDateYMD();
+  if (!ymd) return;
+  const hours = getHours();
+  const z0 = Math.max(0, Math.floor(map.getZoom()));
+  const maxZ = Math.min(14, z0 + 3);
+  const b = map.getBounds();
+  for (let z = z0 + 1; z <= maxZ; z++) {
+    const r = tileRangeForBounds(b, z);
+    for (let x = r.xmin; x <= r.xmax; x++) for (let y = r.ymin; y <= r.ymax; y++) {
+      const u = tileUrl(z, x, y, ymd, hours);
+      if (prefetched.has(u)) continue;
+      prefetched.add(u);
+      prefetchPush(() => fetch(u, { cache: "force-cache" }));
     }
   }
+}
 
   function debounce(fn,ms){let t=0;return()=>{clearTimeout(t);t=setTimeout(fn,ms)}}
   const prefetchDebounced=debounce(prefetchViewportTiles,250);
@@ -237,12 +244,90 @@
 
   const CN_SRC="cn_tracks_src",CN_LINE_GLOW="cn_tracks_line_glow",CN_LINE="cn_tracks_line";
   const LAYER_ID="melt_layer",SRC_ID="melt_src";
-
-  const LEGENDS={
-    "24":{colors:["#dcdcdc","#990000","#cc3333","#ff6666","#cccc66","#ff8c00","#ffff66","#99ff99","#00ff00","#66cc66","#6666ff","#3333cc","#000099","#990099"],labels:["0.00 to trace","trace to 0.02","0.02 to 0.04","0.04 to 0.08","0.08 to 0.12","0.12 to 0.16","0.16 to 0.20","0.20 to 0.39","0.39 to 0.59","0.59 to 0.79","0.79 to 0.98","0.98 to 1.4","1.4 to 2.0","> 2.0"]},
-    "72":{colors:["#dcdcdc","#990000","#cc3333","#ff6666","#cccc66","#ff8c00","#ffff66","#99ff99","#00ff00","#66cc66","#6666ff","#3333cc","#000099","#990099"],labels:["0.00 to trace","trace to 0.04","0.04 to 0.08","0.08 to 0.16","0.16 to 0.24","0.24 to 0.31","0.31 to 0.39","0.39 to 0.79","0.79 to 1.4","1.4 to 2.0","2.0 to 3.0","3.0 to 3.9","3.9 to 9.8","> 9.8"]}
+  
+  const LEGENDS = {
+    "24": {
+      colors: [
+        "#dcdcdc",
+        "#990000",
+        "#cc3333",
+        "#ff6666",
+        "#cccc66",
+        "#ff8c00",
+        "#ffff66",
+        "#99ff99",
+        "#00ff00",
+        "#66cc66",
+        "#6666ff",
+        "#3333cc",
+        "#000099",
+        "#990099",
+        "#4b0082",
+        "#2f004f",
+        "#000000"
+      ],
+      labels: [
+        "0.00 to trace",
+        "trace to 0.02",
+        "0.02 to 0.04",
+        "0.04 to 0.08",
+        "0.08 to 0.12",
+        "0.12 to 0.16",
+        "0.16 to 0.20",
+        "0.20 to 0.39",
+        "0.39 to 0.59",
+        "0.59 to 0.79",
+        "0.79 to 0.98",
+        "0.98 to 1.4",
+        "1.4 to 2.0",
+        "2.0 to 3.0",
+        "3.0 to 4.0",
+        "4.0 to 5.0",
+        "> 5.0"
+      ]
+    },
+    "72": {
+      colors: [
+        "#dcdcdc",
+        "#990000",
+        "#cc3333",
+        "#ff6666",
+        "#cccc66",
+        "#ff8c00",
+        "#ffff66",
+        "#99ff99",
+        "#00ff00",
+        "#66cc66",
+        "#6666ff",
+        "#3333cc",
+        "#000099",
+        "#990099",
+        "#4b0082",
+        "#2f004f",
+        "#000000"
+      ],
+      labels: [
+        "0.00 to trace",
+        "trace to 0.04",
+        "0.04 to 0.08",
+        "0.08 to 0.16",
+        "0.16 to 0.24",
+        "0.24 to 0.31",
+        "0.31 to 0.39",
+        "0.39 to 0.79",
+        "0.79 to 1.4",
+        "1.4 to 2.0",
+        "2.0 to 3.0",
+        "3.0 to 3.9",
+        "3.9 to 5.0",
+        "5.0 to 6.5",
+        "6.5 to 8.0",
+        "8.0 to 9.8",
+        "> 9.8"
+      ]
+    }
   };
-
+  
   function renderLegend(hours){
     const L=LEGENDS[String(hours)]||LEGENDS["24"];
     legendGrid.innerHTML="";
@@ -435,17 +520,21 @@
     return ok;
   }
 
-  async function fetchValueAt(lngLat,point){
-    const ymd=selectedDateYMD(); if(!ymd)return;
-    if(pixelLooksEmpty(point)){showCursorReadout(point.x,point.y,"");return}
-    const hours=getHours(),qLon=quantize(lngLat.lng,QUANT_DEG),qLat=quantize(lngLat.lat,QUANT_DEG);
-    startCursorRingPrefetch(ymd,hours,qLon,qLat);
-    const key=`${ymd}|${hours}|${qLon.toFixed(6)}|${qLat.toFixed(6)}`;
-    if(key===lastKey)return;
-    lastKey=key;
-    const cached=cacheGet(key);
-    if(cached!=null){showCursorReadout(point.x,point.y,cached);return}
-    fetchAndCache(ymd,hours,qLon,qLat,key,true,point);
+  async function fetchValueAt(lngLat, point) {
+    if (map.getZoom() < CURSOR_ZMIN) { showCursorReadout(point.x, point.y, ""); lastKey=""; return; }
+    const ymd = selectedDateYMD();
+    if (!ymd) return;
+    if (pixelLooksEmpty(point)) { showCursorReadout(point.x, point.y, ""); return; }
+    const hours = getHours();
+    const qLon = quantize(lngLat.lng, QUANT_DEG);
+    const qLat = quantize(lngLat.lat, QUANT_DEG);
+    startCursorRingPrefetch(ymd, hours, qLon, qLat);
+    const key = `${ymd}|${hours}|${qLon.toFixed(6)}|${qLat.toFixed(6)}`;
+    if (key === lastKey) return;
+    lastKey = key;
+    const cached = cacheGet(key);
+    if (cached != null) { showCursorReadout(point.x, point.y, cached); return; }
+    fetchAndCache(ymd, hours, qLon, qLat, key, true, point);
   }
 
   function maybeFire(){
@@ -481,6 +570,16 @@
 
   map.on("zoomend",()=>{shouldReadout();prefetchDebounced()});
   map.on("moveend",prefetchDebounced);
+  map.on("zoomend", () => {
+    if (map.getZoom() < CURSOR_ZMIN) {
+      lastKey = "";
+      showCursorReadout(0,0,"");
+      if (ringAbort) { try { ringAbort.abort(); } catch {} }
+      cursorPrefetchPush.clear();
+      ringCenterKey = "";
+    }
+    prefetchDebounced();
+  });
 
   map.on("load",async()=>{
     try{
