@@ -166,7 +166,9 @@
 
   const HF_DATASET_REPO=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.HF_DATASET_REPO)||"Jsinowitz/snodas-snowmelt-cache";
   const HF_TILE_BASE=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.HF_TILE_BASE)||("https://huggingface.co/datasets/"+HF_DATASET_REPO+"/resolve/main");
-  const USE_HF_TILES = true;
+  const USE_HF_TILES = false;
+  const CN_SRC="cn_tracks_src",CN_LINE_GLOW="cn_tracks_src_line_glow",CN_LINE="cn_tracks_src_line";
+  const LAYER_ID="melt_layer",SRC_ID="melt_src";
 
   function muteRoads(map){
     const style=map.getStyle(); if(!style||!style.layers)return;
@@ -201,14 +203,71 @@
     return HF_TILE_BASE+`/tilecache/bydate_${dom}_h${hours}_${ymd}_z{z}_{x}_{y}.png`;
   }
 
-  function tileUrl(z,x,y,ymd,hours){
-    if(USE_HF_TILES){
-      const u=hfTileUrlTemplate(ymd,hours,DOM);
-      return u.replace("{z}", String(z)).replace("{x}", String(x)).replace("{y}", String(y));
+  // Custom tile loading with fallback
+  function setupTileSourceWithFallback(ymd, hours) {
+    const dom = (DOM || "zz").toLowerCase();
+    
+    // Create a custom tile source that tries HF first, falls back to FastAPI
+    const customSource = {
+      type: 'raster',
+      tiles: [`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${dom}`],
+      tileSize: 256,
+      maxzoom: 12
+    };
+    
+    return customSource;
+  }
+  
+  function setTilesForSelection() {
+    const ymd = selectedDateYMD();
+    const hours = getHours();
+    if (!ymd) return;
+    
+    subtitle.textContent = subtitleText(ymd, hours);
+    renderLegend(hours);
+  
+    cursorEl.style.display = "none";
+    lastKey = "";
+    reqId++;
+    valCache.clear();
+    inflight.clear();
+    if (ringAbort) {
+      try { ringAbort.abort(); } catch {}
     }
+    cursorPrefetchPush.clear();
+    ringCenterKey = "";
+    
+    const sourceConfig = setupTileSourceWithFallback(ymd, hours);
+    
+    if (map.getSource(SRC_ID)) {
+      map.getSource(SRC_ID).setTiles(sourceConfig.tiles);
+      map.triggerRepaint();
+      prefetched.clear();
+      prefetchViewportTiles();
+      return;
+    }
+    
+    map.addSource(SRC_ID, sourceConfig);
+    map.addLayer({
+      id: LAYER_ID,
+      type: 'raster',
+      source: SRC_ID,
+      paint: { 'raster-opacity': parseFloat(OPACITY.value) }
+    });
+    
+    if (map.getLayer(CN_LINE) && map.getLayer(LAYER_ID)) {
+      map.moveLayer(CN_LINE_GLOW, LAYER_ID);
+      map.moveLayer(CN_LINE, LAYER_ID);
+    }
+    
+    prefetched.clear();
+    prefetchViewportTiles();
+  }
+  
+  // Update tileUrl function to always use FastAPI
+  function tileUrl(z, x, y, ymd, hours) {
     return `/tiles/forecast/by_date/${z}/${x}/${y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`;
   }
-
   function makeQueue(limit){
     let active=0;const q=[];
     const run=()=>{while(active<limit&&q.length){const fn=q.shift();active++;Promise.resolve().then(fn).catch(()=>{}).finally(()=>{active--;run()})}};
@@ -242,7 +301,7 @@
     if (!ymd) return;
     const hours = getHours();
     const z0 = Math.max(0, Math.floor(map.getZoom()));
-    const maxZ = Math.min(10, z0 + 3);
+    const maxZ = Math.min(12, z0 + 3);
     const b = map.getBounds();
     for (let z = z0 + 1; z <= maxZ; z++) {
       const r = tileRangeForBounds(b, z);
@@ -261,8 +320,6 @@
   map.on("load",()=>muteRoads(map));
   map.on("styledata",()=>muteRoads(map));
 
-  const CN_SRC="cn_tracks_src",CN_LINE_GLOW="cn_tracks_src_line_glow",CN_LINE="cn_tracks_src_line";
-  const LAYER_ID="melt_layer",SRC_ID="melt_src";
 
   const LEGENDS = {
     "24": {
@@ -326,24 +383,24 @@
 
   function setOpacity(v){OPV.textContent=v.toFixed(2);if(map.getLayer(LAYER_ID))map.setPaintProperty(LAYER_ID,"raster-opacity",v)}
 
-  function setTilesForSelection(){
-    const ymd=selectedDateYMD(),hours=getHours(); if(!ymd)return;
-    subtitle.textContent=subtitleText(ymd,hours);
-    renderLegend(hours);
+  // function setTilesForSelection(){
+  //   const ymd=selectedDateYMD(),hours=getHours(); if(!ymd)return;
+  //   subtitle.textContent=subtitleText(ymd,hours);
+  //   renderLegend(hours);
 
-    const tiles = USE_HF_TILES
-      ? [hfTileUrlTemplate(ymd,hours,DOM)]
-      : [`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`];
+  //   const tiles = USE_HF_TILES
+  //     ? [hfTileUrlTemplate(ymd,hours,DOM)]
+  //     : [`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`];
 
-    cursorEl.style.display="none";lastKey="";reqId++;valCache.clear();inflight.clear();
-    if(ringAbort){try{ringAbort.abort()}catch{}}
-    cursorPrefetchPush.clear();ringCenterKey="";
-    if(map.getSource(SRC_ID)){map.getSource(SRC_ID).setTiles(tiles);map.triggerRepaint();prefetched.clear();prefetchViewportTiles();return}
-    map.addSource(SRC_ID,{type:"raster",tiles,tileSize:256,maxzoom:10});
-    map.addLayer({id:LAYER_ID,type:"raster",source:SRC_ID,paint:{"raster-opacity":parseFloat(OPACITY.value)}});
-    if(map.getLayer(CN_LINE)&&map.getLayer(LAYER_ID)){map.moveLayer(CN_LINE_GLOW,LAYER_ID);map.moveLayer(CN_LINE,LAYER_ID)}
-    prefetched.clear();prefetchViewportTiles();
-  }
+  //   cursorEl.style.display="none";lastKey="";reqId++;valCache.clear();inflight.clear();
+  //   if(ringAbort){try{ringAbort.abort()}catch{}}
+  //   cursorPrefetchPush.clear();ringCenterKey="";
+  //   if(map.getSource(SRC_ID)){map.getSource(SRC_ID).setTiles(tiles);map.triggerRepaint();prefetched.clear();prefetchViewportTiles();return}
+  //   map.addSource(SRC_ID,{type:"raster",tiles,tileSize:256,maxzoom:10});
+  //   map.addLayer({id:LAYER_ID,type:"raster",source:SRC_ID,paint:{"raster-opacity":parseFloat(OPACITY.value)}});
+  //   if(map.getLayer(CN_LINE)&&map.getLayer(LAYER_ID)){map.moveLayer(CN_LINE_GLOW,LAYER_ID);map.moveLayer(CN_LINE,LAYER_ID)}
+  //   prefetched.clear();prefetchViewportTiles();
+  // }
 
   function setSelectOptions(sel,options,value,disabledSet){
     sel.innerHTML="";
@@ -485,11 +542,22 @@
     return ok;
   }
 
+  // In web/index.html, update the fetchValueAt function to handle errors:
   async function fetchValueAt(lngLat, point) {
-    if (map.getZoom() < CURSOR_ZMIN) { showCursorReadout(point.x, point.y, ""); lastKey=""; return; }
+    if (map.getZoom() < CURSOR_ZMIN) { 
+      showCursorReadout(point.x, point.y, ""); 
+      lastKey=""; 
+      return; 
+    }
     const ymd = selectedDateYMD();
-    if (!ymd) return;
-    if (pixelLooksEmpty(point)) { showCursorReadout(point.x, point.y, ""); return; }
+    if (!ymd) {
+      showCursorReadout(point.x, point.y, "No date selected");
+      return;
+    }
+    if (pixelLooksEmpty(point)) { 
+      showCursorReadout(point.x, point.y, ""); 
+      return; 
+    }
     const hours = getHours();
     const qLon = quantize(lngLat.lng, QUANT_DEG);
     const qLat = quantize(lngLat.lat, QUANT_DEG);
@@ -498,7 +566,13 @@
     if (key === lastKey) return;
     lastKey = key;
     const cached = cacheGet(key);
-    if (cached != null) { showCursorReadout(point.x, point.y, cached); return; }
+    if (cached != null) { 
+      showCursorReadout(point.x, point.y, cached); 
+      return; 
+    }
+    
+    // Show loading indicator while fetching
+    showCursorReadout(point.x, point.y, "Loading...");
     fetchAndCache(ymd, hours, qLon, qLat, key, true, point);
   }
 
