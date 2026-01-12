@@ -29,8 +29,8 @@ LOWRES_Z = int(os.environ.get("LOWRES_Z", "6"))         # serve off-track as z=6
 LOWRES_MAX_REQUEST_Z = int(os.environ.get("LOWRES_MAX_REQUEST_Z", "14"))
 LOWRES_BOX_ZMIN = int(os.environ.get("LOWRES_BOX_ZMIN", "4"))  # pre-bake lowres tiles at these zooms
 LOWRES_BOX_ZMAX = int(os.environ.get("LOWRES_BOX_ZMAX", "6"))
-HF_MAX_OPS_PER_COMMIT = int(os.environ.get("HF_MAX_OPS_PER_COMMIT", "800"))
-HF_PUSH_SLEEP_SEC = float(os.environ.get("HF_PUSH_SLEEP_SEC", "0.0"))
+HF_MAX_OPS_PER_COMMIT = int(os.environ.get("HF_MAX_OPS_PER_COMMIT", "300"))
+HF_PUSH_SLEEP_SEC = float(os.environ.get("HF_PUSH_SLEEP_SEC", "0.5"))
 
 ROLL_WINDOW_DAYS = int(os.environ.get("ROLL_WINDOW_DAYS", "5"))  # yesterday..+2
 SCHEDULE_HOUR_LOCAL = int(os.environ.get("SCHEDULE_HOUR_LOCAL", "7"))  # 7am local
@@ -43,6 +43,7 @@ WARM_CAP_PER_ZOOM = int(os.environ.get("WARM_CAP_PER_ZOOM", "6000"))
 WARM_MAX_TILES_TOTAL = int(os.environ.get("WARM_MAX_TILES_TOTAL", "40000"))
 WARM_DOM = os.environ.get("WARM_DOM", "zz").lower()
 WARM_MILES = float(os.environ.get("WARM_MILES", "10"))
+# BOOT_ROLL_DEFAULT = os.environ.get("RUN_BOOT_ROLL", "1")
 BOOT_ROLL_DEFAULT = os.environ.get("RUN_BOOT_ROLL", "1")
 
 # Corridor prewarm hours (24 and 72)
@@ -60,6 +61,26 @@ CACHE_CONTROL_LATEST = os.environ.get(
     "CACHE_CONTROL_LATEST",
     "public, max-age=900",
 )
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+def _is_valid_png_file(p: Path) -> bool:
+    try:
+        if not p.exists():
+            return False
+        st = p.stat()
+        if st.st_size < 64:
+            return False
+        with p.open("rb") as f:
+            head = f.read(8)
+        return head == PNG_MAGIC
+    except Exception:
+        return False
+
+def _safe_unlink(p: Path) -> None:
+    try:
+        p.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 def _tile_cache_dir() -> Path:
     d = CACHE / "tilecache"
@@ -148,9 +169,12 @@ def _lock(key: str) -> threading.Lock:
 
 def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> bytes | None:
     p = _tile_cache_path(dom, hours, ymd, z, x, y)
+
     try:
-        if p.exists() and p.stat().st_size > 0:
+        if _is_valid_png_file(p):
             return p.read_bytes()
+        elif p.exists():
+            _safe_unlink(p)
     except Exception:
         pass
 
@@ -158,12 +182,16 @@ def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> b
         return None
 
     rel = p.relative_to(CACHE).as_posix()
+
     if _hf_try_pull_file(rel):
         try:
-            if p.exists() and p.stat().st_size > 0:
+            if _is_valid_png_file(p):
                 return p.read_bytes()
+            elif p.exists():
+                _safe_unlink(p)
         except Exception:
             return None
+
     return None
 
 def _tile_cache_put(dom: str, hours: int, ymd: str, z: int, x: int, y: int, png: bytes) -> None:
@@ -546,29 +574,64 @@ def _local_cache_paths_to_consider() -> list[Path]:
             out.append(p)
     return out
 
+def _is_lfs_pointer_bytes(b: bytes) -> bool:
+    if not b:
+        return False
+    if b.startswith(b"version https://git-lfs.github.com/spec/v1"):
+        return True
+    if b"git-lfs.github.com/spec/v1" in b[:200]:
+        return True
+    return False
+
+
 def _hf_pull_cache() -> None:
     tok, repo = _hf_cfg()
     if not tok or not repo:
-        _log("INFO", "[hf_cache] pull skipped (HF_TOKEN/HF_DATASET_REPO unset)")
+        _log("INFO", "[hf] pull cache disabled (missing HF_TOKEN or HF_DATASET_REPO)")
+        return
+
+    api = _hf_api()
+    if api is None:
+        _log("INFO", "[hf] pull cache disabled (no api)")
         return
 
     try:
         snapshot_download(
             repo_id=repo,
             repo_type="dataset",
+            token=tok,
             local_dir=str(CACHE),
             local_dir_use_symlinks=False,
-            token=tok,
+            resume_download=True,
             allow_patterns=[
-              "melt24h_*_cog.tif",
-              "melt72h_end_*_cog.tif",
-              "forecast/*_cog.tif",
-              "tilecache/**/*.png",
+                "tilecache/**",
+                "forecast/**",
+                "melt24h_*_cog.tif",
+                "melt72h_end_*_cog.tif",
             ],
         )
-        _log("INFO", f"[hf_cache] pull OK repo={repo}")
     except Exception as e:
-        _log("INFO", f"[hf_cache] pull FAIL repo={repo} err={e!r}")
+        _log("WARN", f"[hf] snapshot_download failed err={e!r}")
+        return
+
+    # Clean up accidental LFS pointer files or tiny junk PNGs
+    try:
+        removed = 0
+        for p in CACHE.rglob("*.png"):
+            try:
+                b = p.read_bytes()
+                if _is_lfs_pointer_bytes(b) or p.stat().st_size < 200:
+                    p.unlink(missing_ok=True)
+                    removed += 1
+            except Exception:
+                pass
+        if removed:
+            _log("WARN", f"[hf] removed {removed} tiny/LFS-pointer pngs after snapshot pull")
+    except Exception:
+        pass
+
+    _log("INFO", "[hf] pull cache done")
+
 
 def _hf_commit(ops: list, message: str) -> None:
     api = _hf_api()
@@ -1211,14 +1274,6 @@ def _pick_forecast_for_valid(valid: str, dom_prefer: str = "zz") -> dict:
         return {"ok": False, "run_init": run_init, "valid": valid, "error": "melt file not found for run_init+valid"}
 
     snowpack_urls = _find_fcst_11034_grib2_tt_ts(run_init, valid, dom_prefer=dom_prefer)
-    if not snowpack_urls:
-        return {
-            "ok": False,
-            "run_init": run_init,
-            "valid": valid,
-            "melt_urls": melt_urls,
-            "error": "no forecasted snowpack (11034 grib2) found for TT+TS",
-        }
 
     return {
         "ok": True,
@@ -1227,8 +1282,10 @@ def _pick_forecast_for_valid(valid: str, dom_prefer: str = "zz") -> dict:
         "lead": "t0024",
         "melt_urls": melt_urls,
         "snowpack_ts": valid,
-        "snowpack_urls": snowpack_urls,
+        "snowpack_urls": snowpack_urls or [],
+        "snowpack_missing": (not bool(snowpack_urls)),
     }
+
 
 def _pick_forecast_for_days(days: int, dom_prefer: str = "zz") -> dict:
     if days not in (2, 3):
@@ -1767,30 +1824,60 @@ def _is_probably_html(blob: bytes) -> bool:
     head = blob[:512].lstrip()
     return head.startswith(b"<!DOCTYPE") or head.startswith(b"<html") or head.startswith(b"<HTML")
 
+
 def _hf_try_pull_file(rel: str) -> bool:
     tok, repo = _hf_cfg()
-    if not repo:
+    if not tok or not repo:
         return False
-    rel = rel.replace("\\", "/").lstrip("/")
+
+    rel = (rel or "").lstrip("/")
+    if not rel:
+        return False
+
+    dest = (CACHE / rel).resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
     try:
-        p = Path(CACHE) / rel
-        if p.exists() and p.stat().st_size > 0:
-            return True
-    except Exception:
-        pass
-    try:
-        out = hf_hub_download(
+        tmp = hf_hub_download(
             repo_id=repo,
             repo_type="dataset",
             filename=rel,
+            token=tok,
             local_dir=str(CACHE),
-           # local_dir_use_symlinks=False,
-            token=tok if tok else None,
+            local_dir_use_symlinks=False,
         )
-        return bool(out)
-    except Exception:
+    except Exception as e:
+        _log("WARN", f"[hf] pull miss rel={rel} err={e}")
         return False
 
+    try:
+        p = Path(tmp)
+        if not p.exists():
+            return False
+
+        b = p.read_bytes()
+        if _is_lfs_pointer_bytes(b) or len(b) < 200:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:
+                pass
+            _log("WARN", f"[hf] pulled LFS pointer / tiny file for {rel} ({len(b)} bytes); treating as miss")
+            return False
+
+        if p.resolve() != dest:
+            try:
+                dest.write_bytes(b)
+            except Exception:
+                pass
+
+        return True
+    except Exception as e:
+        _log("WARN", f"[hf] pull validate failed rel={rel} err={e}")
+        return False
 def _is_netcdf_bytes(blob: bytes) -> bool:
     if len(blob) >= 4 and blob[:3] == b"CDF" and blob[3] in (1, 2):
         return True
