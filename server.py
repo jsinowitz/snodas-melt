@@ -23,6 +23,10 @@ from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub import hf_hub_download
 from huggingface_hub._commit_api import CommitOperationAdd, CommitOperationDelete
 from zoneinfo import ZoneInfo
+import sqlite3
+from rio_tiler.colormap import cmap
+# from PIL import Image
+# supposed to import mercantile? Says there isnt a module named mercantile, same with PIL above
 
 LOCAL_TZ = ZoneInfo(os.environ.get("LOCAL_TZ", "America/Chicago"))
 LOWRES_Z = int(os.environ.get("LOWRES_Z", "6"))         # serve off-track as z=6 tile
@@ -48,6 +52,9 @@ BOOT_ROLL_DEFAULT = os.environ.get("RUN_BOOT_ROLL", "1")
 
 # Corridor prewarm hours (24 and 72)
 WARM_HOURS_LIST = [24, 72]
+CN_MBTILES_LOCAL = Path("cache") / "tracks" / "cn_tracks.mbtiles"
+CN_MBTILES_REPO_PATH = "tracks/cn_tracks.mbtiles"
+CN_BOUNDS_REPO_PATH = "tracks/cn_tracks.bounds.txt"
 
 # How long to keep tile PNGs and forecast COGs (days of YYYYMMDD date keys)
 KEEP_TILE_DAYS = int(os.environ.get("KEEP_TILE_DAYS", "5"))     # keeps a little extra buffer
@@ -163,6 +170,26 @@ def _lock(key: str) -> threading.Lock:
         if l is None:
             l = _BUILD_LOCKS[key] = threading.Lock()
         return l
+def _hf_cfg_norm():
+    cfg = _hf_cfg()
+
+    if isinstance(cfg, dict):
+        ok = bool(cfg.get("ok"))
+        repo = cfg.get("repo") or cfg.get("dataset_repo") or cfg.get("repo_id")
+        token = cfg.get("token") or cfg.get("hf_token")
+        return ok, repo, token, cfg
+
+    if isinstance(cfg, tuple):
+        if len(cfg) == 0:
+            return False, None, None, {"raw": cfg}
+        if len(cfg) == 1:
+            return bool(cfg[0]), None, None, {"raw": cfg}
+        if len(cfg) == 2:
+            return bool(cfg[0]), cfg[1], None, {"raw": cfg}
+        # assume (ok, repo, token, ...)
+        return bool(cfg[0]), cfg[1], (cfg[2] if len(cfg) >= 3 else None), {"raw": cfg}
+
+    return False, None, None, {"raw": cfg}
 
 def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> bytes | None:
     """Try to get cached tile: 1) local disk, 2) HF repo. Returns None if not found."""
@@ -196,8 +223,6 @@ def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> b
     # Not found in either location
     return None
 
-
-
 def _tile_cache_put(dom: str, hours: int, ymd: str, z: int, x: int, y: int, png: bytes) -> None:
     p = _tile_cache_path(dom, hours, ymd, z, x, y)
     try:
@@ -207,7 +232,81 @@ def _tile_cache_put(dom: str, hours: int, ymd: str, z: int, x: int, y: int, png:
         tmp.replace(p)
     except Exception:
         pass
-        
+
+CN_MBTILES_LOCAL = Path("cache") / "tracks" / "cn_tracks.mbtiles"
+CN_MBTILES_REPO_PATH = "tracks/cn_tracks.mbtiles"
+
+def _ensure_cn_mbtiles() -> Path:
+    CN_MBTILES_LOCAL.parent.mkdir(parents=True, exist_ok=True)
+
+    if CN_MBTILES_LOCAL.exists() and CN_MBTILES_LOCAL.stat().st_size > 1024 * 1024:
+        return CN_MBTILES_LOCAL
+
+    ok, repo, token, raw = _hf_cfg_norm()
+    if not ok or not repo:
+        raise RuntimeError(f"HF not configured; cannot download cn_tracks.mbtiles; cfg={raw!r}")
+
+    from huggingface_hub import hf_hub_download
+
+    p = hf_hub_download(
+        repo_id=repo,
+        repo_type="dataset",
+        filename=CN_MBTILES_REPO_PATH,
+        token=token or None,
+        local_dir=str(CN_MBTILES_LOCAL.parent),
+        local_dir_use_symlinks=False,
+    )
+
+    downloaded = Path(p)
+    if downloaded != CN_MBTILES_LOCAL:
+        try:
+            downloaded.replace(CN_MBTILES_LOCAL)
+        except Exception:
+            pass
+
+    return CN_MBTILES_LOCAL
+
+
+
+def _mbtiles_xyz_to_tms(z: int, y: int) -> int:
+    return (1 << int(z)) - 1 - int(y)
+
+@lru_cache(maxsize=1)
+def _cn_mbtiles_conn() -> sqlite3.Connection:
+    p = _ensure_cn_mbtiles()
+    conn = sqlite3.connect(str(p), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _mbtiles_get_tile(conn: sqlite3.Connection, z: int, x: int, y: int) -> bytes | None:
+    tms_y = _mbtiles_xyz_to_tms(z, y)
+    row = conn.execute(
+        "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+        (int(z), int(x), int(tms_y)),
+    ).fetchone()
+    if not row:
+        return None
+    return row["tile_data"]
+    
+@lru_cache(maxsize=1)
+def _cn_mbtiles_maxzoom() -> int:
+    conn = _cn_mbtiles_conn()
+    try:
+        row = conn.execute("SELECT value FROM metadata WHERE name='maxzoom' LIMIT 1").fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+    except Exception:
+        pass
+
+    try:
+        row = conn.execute("SELECT MAX(zoom_level) FROM tiles").fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+    except Exception:
+        pass
+
+    return 12
+
 def _generate_forecast_by_date_png(
     *,
     z: int,
@@ -892,56 +991,95 @@ def _yyyymmdd(d) -> str:
 #             return p
 
 #     return None
-def _track_geojson_path() -> Path:
+# def _track_geojson_path() -> Path:
+#     candidates = [
+#         Path("web") / "cn_tracks.geojson",
+#         Path("web") / "cn_tracks_src.geojson",
+#         Path("web") / "NTAD_North_American_Rail_Network_Lines_CN_-6165835494608975392.geojson",
+#     ]
+#     for p in candidates:
+#         if p.exists():
+#             return p
+#     return candidates[0]  # default
+
+
+# def _load_track_points(max_points: int = 35000) -> list[tuple[float, float]]:
+#     p = _track_geojson_path()
+#     if p is None:
+#         _log("INFO", "[prewarm] cn_tracks.geojson not found")
+#         return []
+
+#     try:
+#         gj = json.loads(p.read_text(encoding="utf-8"))
+#     except Exception as e:
+#         _log("INFO", f"[prewarm] failed to read cn_tracks.geojson err={e!r}")
+#         return []
+
+#     pts: list[tuple[float, float]] = []
+
+#     def add_coords(coords):
+#         nonlocal pts
+#         if not coords:
+#             return
+#         if isinstance(coords[0], (int, float)) and len(coords) >= 2:
+#             lon, lat = float(coords[0]), float(coords[1])
+#             if np.isfinite(lon) and np.isfinite(lat):
+#                 pts.append((lon, lat))
+#             return
+#         for c in coords:
+#             add_coords(c)
+
+#     feats = gj.get("features") or []
+#     for f in feats:
+#         g = f.get("geometry") or {}
+#         add_coords(g.get("coordinates"))
+
+#     if not pts:
+#         return []
+
+#     if len(pts) > max_points:
+#         step = max(1, len(pts) // max_points)
+#         pts = pts[::step]
+#     return pts
+def _track_points_path() -> Path:
     candidates = [
-        Path("web") / "cn_tracks.geojson",
-        Path("web") / "cn_tracks_src.geojson",
-        Path("web") / "NTAD_North_American_Rail_Network_Lines_CN_-6165835494608975392.geojson",
+        Path("web") / "cn_track_points.npz",
+        Path("cn_track_points.npz"),
+        Path("cache") / "cn_track_points.npz",
     ]
     for p in candidates:
         if p.exists():
             return p
-    return candidates[0]  # default
+    return candidates[0]
 
 
+@lru_cache(maxsize=4)
 def _load_track_points(max_points: int = 35000) -> list[tuple[float, float]]:
-    p = _track_geojson_path()
-    if p is None:
-        _log("INFO", "[prewarm] cn_tracks.geojson not found")
+    p = _track_points_path()
+    if not p.exists():
+        _log("INFO", f"[prewarm] cn_track_points.npz not found at {p}")
         return []
 
     try:
-        gj = json.loads(p.read_text(encoding="utf-8"))
+        data = np.load(str(p))
+        arr = data["lonlat"]
+        # expect shape (N,2)
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            _log("INFO", f"[prewarm] cn_track_points.npz has unexpected shape {arr.shape}")
+            return []
+        arr = arr.astype(np.float64, copy=False)
     except Exception as e:
-        _log("INFO", f"[prewarm] failed to read cn_tracks.geojson err={e!r}")
+        _log("INFO", f"[prewarm] failed to read cn_track_points.npz err={e!r}")
         return []
 
-    pts: list[tuple[float, float]] = []
-
-    def add_coords(coords):
-        nonlocal pts
-        if not coords:
-            return
-        if isinstance(coords[0], (int, float)) and len(coords) >= 2:
-            lon, lat = float(coords[0]), float(coords[1])
-            if np.isfinite(lon) and np.isfinite(lat):
-                pts.append((lon, lat))
-            return
-        for c in coords:
-            add_coords(c)
-
-    feats = gj.get("features") or []
-    for f in feats:
-        g = f.get("geometry") or {}
-        add_coords(g.get("coordinates"))
-
-    if not pts:
+    if arr.shape[0] == 0:
         return []
 
-    if len(pts) > max_points:
-        step = max(1, len(pts) // max_points)
-        pts = pts[::step]
-    return pts
+    if arr.shape[0] > int(max_points):
+        step = max(1, int(arr.shape[0]) // int(max_points))
+        arr = arr[::step]
+
+    return [(float(lon), float(lat)) for lon, lat in arr]
 
 
 def _lonlat_to_tile(lon: float, lat: float, z: int) -> tuple[int, int]:
@@ -3290,6 +3428,11 @@ def _startup() -> None:
             _hf_pull_cache()
         except Exception:
             pass
+        try:
+            _ensure_cn_mbtiles()
+        except Exception as e:
+            _log("WARN", f"[tracks] failed to ensure cn mbtiles: {e!r}")
+
     else:
         _log("INFO", "[startup] hf pull skipped (another worker holds lock)")
 
@@ -3521,6 +3664,7 @@ def value_forecast_by_date(
         inches_1dp = None if inches is None else round(inches, 1)
         return {"ok": True, "hours": 72, "valid": valid, "run_init": run_init, "mm": None if mm is None else float(mm), "inches": inches, "inches_1dp": inches_1dp, "info": info}
 
+
 @app.get("/tiles/forecast/by_date/{z}/{x}/{y}.png")
 def tiles_forecast_by_date(
     z: int,
@@ -3531,11 +3675,15 @@ def tiles_forecast_by_date(
     max: float | None = Query(None),
     dom: str = Query("zz"),
 ):
-    """Serve forecast tiles by date. Fallback chain: HF repo -> local cache -> build on-demand."""
-    
-    # Effective tile resolution (handles low-res fallback for off-corridor tiles)
-    z_eff, x_eff, y_eff, tier = _effective_request_tile(z, x, y)
-    
+    dom = (dom or "zz").lower()
+
+    # Keep your gating logic if you want, but DO NOT change z/x/y when generating.
+    # If your existing function returns "none", still return transparent.
+    try:
+        _z_eff, _x_eff, _y_eff, tier = _effective_request_tile(z, x, y)
+    except Exception:
+        tier = "ok"
+
     if tier == "none":
         return _resp_png(
             _transparent_png_256(),
@@ -3543,63 +3691,59 @@ def tiles_forecast_by_date(
             **{"X-Route": "forecast-by-date", "X-Allowed": "0"},
         )
 
-    dom = (dom or "zz").lower()
-    
-    # Try to get from cache (checks local, then HF)
+    # Cache lookup MUST use the requested tile coords (z,x,y)
     if max is None:
-        hit = _tile_cache_get(dom, int(hours), date_yyyymmdd, z_eff, x_eff, y_eff)
+        hit = _tile_cache_get(dom, int(hours), date_yyyymmdd, z, x, y)
         if hit is not None:
             return _resp_png(
                 hit,
                 cache_control=CACHE_CONTROL_BY_DATE,
                 **{
-                    "X-Route": "forecast-by-date", 
-                    "X-Allowed": "1", 
+                    "X-Route": "forecast-by-date",
+                    "X-Allowed": "1",
                     "X-Cache": "hit",
                     "X-Tier": tier,
-                    "X-Effective-Tile": f"{z_eff}/{x_eff}/{y_eff}"
+                    "X-Tile": f"{z}/{x}/{y}",
                 },
             )
 
-    # Not in cache - generate on-demand
+    # Generate MUST use the requested tile coords (z,x,y)
     try:
         png, headers = _generate_forecast_by_date_png(
-            z=z_eff,
-            x=x_eff,
-            y=y_eff,
+            z=z,
+            x=x,
+            y=y,
             date_yyyymmdd=date_yyyymmdd,
             hours=hours,
             dom=dom,
             max_in=max,
         )
-        
-        # Cache the generated tile
+
         if max is None:
             try:
-                _tile_cache_put(dom, int(hours), date_yyyymmdd, z_eff, x_eff, y_eff, png)
-                # Enqueue for HF push (will be pushed in next flush)
-                _hf_enqueue_files([_tile_cache_path(dom, int(hours), date_yyyymmdd, z_eff, x_eff, y_eff)])
+                _tile_cache_put(dom, int(hours), date_yyyymmdd, z, x, y, png)
+                _hf_enqueue_files([_tile_cache_path(dom, int(hours), date_yyyymmdd, z, x, y)])
                 cache_status = "generated-and-cached"
             except Exception:
                 cache_status = "generated-only"
         else:
             cache_status = "generated-no-cache-due-to-max"
-        
+
+        headers = dict(headers or {})
+        headers["X-Route"] = "forecast-by-date"
+        headers["X-Allowed"] = "1"
         headers["X-Cache"] = cache_status
         headers["X-Tier"] = tier
-        headers["X-Effective-Tile"] = f"{z_eff}/{x_eff}/{y_eff}"
-        
-        return _resp_png(
-            png,
-            cache_control=CACHE_CONTROL_BY_DATE,
-            **headers,
-        )
-        
+        headers["X-Tile"] = f"{z}/{x}/{y}"
+
+        return _resp_png(png, cache_control=CACHE_CONTROL_BY_DATE, **headers)
+
     except HTTPException as e:
-        # Return error details to help with debugging
         _log("WARN", f"[tiles] forecast/by_date failed: {e.detail}")
         raise
-
+    except Exception as e:
+        _log("WARN", f"[tiles] forecast/by_date failed: {e!r}")
+        raise HTTPException(status_code=500, detail=f"forecast_tile_error: {e!r}")
 @app.get("/tiles/forecast/{ts_key:regex(\\d{8}(?:[_-]?\\d{2}))}/{z}/{x}/{y}.png")
 def tiles_forecast(
     ts_key: str,
@@ -3702,7 +3846,7 @@ def __debug_prewarm_cn(
     dom: str = Query("zz"),
     zmin: int = Query(6, ge=0, le=14),
     zmax: int = Query(12, ge=0, le=14),
-    miles: float = Query(10.0, ge=0.0, le=50.0),
+    miles: float = Query(8.0, ge=0.0, le=50.0),
     cap_per_zoom: int = Query(6000, ge=100, le=20000),
     max_tiles_total: int = Query(20000, ge=100, le=100000),
 ):
@@ -3746,7 +3890,50 @@ def __debug_tile_cache_stats():
                 except Exception:
                     pass
     return {"dir": TILE_CACHE_DIR.as_posix(), "png_files": total_files, "bytes": total_bytes}
-    
+
+
+@app.get("/cn_tiles/{z}/{x}/{y}.pbf")
+def cn_tiles(z: int, x: int, y: int):
+    try:
+        conn = _cn_mbtiles_conn()
+        data = _mbtiles_get_tile(conn, z, x, y)
+
+        if data is None:
+            return Response(
+                content=b"",
+                status_code=204,
+                media_type="application/vnd.mapbox-vector-tile",
+                headers={"Cache-Control": "public, max-age=300"},
+            )
+
+        headers = {"Cache-Control": "public, max-age=31536000, immutable"}
+        if len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B:
+            headers["Content-Encoding"] = "gzip"
+
+        return Response(
+            content=data,
+            media_type="application/vnd.mapbox-vector-tile",
+            headers=headers,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"cn_tiles_error: {e!r}")
+        
+@app.get("/cn_bounds")
+def cn_bounds():
+    try:
+        conn = _cn_mbtiles_conn()
+        row = conn.execute("SELECT value FROM metadata WHERE name='bounds'").fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="no_bounds")
+        bounds = str(row["value"]).strip()  # west,south,east,north
+        parts = [float(x) for x in bounds.split(",")]
+        west, south, east, north = parts
+        return {"bounds": [[west, south], [east, north]]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"cn_bounds_error: {e!r}")
+
 @app.get("/__debug/hf_status")
 def __debug_hf_status():
     tok, repo = _hf_cfg()
@@ -3795,6 +3982,10 @@ def __logs(since_ms: int | None = None, limit: int = 200):
         except Exception:
             pass
     return {"count": len(rows[-limit:]), "items": rows[-limit:]}
+    
+@app.get("/__debug/cn_tracks_maxzoom")
+def __debug_cn_tracks_maxzoom():
+    return {"maxzoom": _cn_mbtiles_maxzoom()}
 
 if __name__ == "__main__":
     import uvicorn
