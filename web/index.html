@@ -1,4 +1,3 @@
-<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -96,6 +95,50 @@
     }
   </style>
 
+</head>
+<body>
+  <div id="map"></div>
+  <div id="cursorReadout" class="cursor-readout"></div>
+
+  <div class="panel-stack">
+    <div class="panel-link">
+      <a href="https://accuweather.atlassian.net/wiki/spaces/AO/pages/3596288537/Snowmelt" id="confluenceLink" target="_blank" rel="noopener">Snowmelt Confluence</a>
+    </div>
+
+    <div class="panel" id="mainPanel">
+      <h3>CN Snowmelt</h3>
+      <div class="sub" id="subtitle">Loading…</div>
+
+      <div class="pickrow">
+        <select id="yearSel"></select>
+        <select id="monthSel"></select>
+        <select id="daySel"></select>
+      </div>
+
+      <div class="row">
+        <input type="radio" name="hours" id="h24" value="24" checked>
+        <label for="h24">24 Hour Snowmelt</label>
+      </div>
+      <div class="row">
+        <input type="radio" name="hours" id="h72" value="72">
+        <label for="h72">72 Hour Snowmelt</label>
+      </div>
+
+      <div class="sliderrow">
+        <div style="font-size:13px;">Opacity</div>
+        <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.80" />
+        <div id="opv" style="font-size:12px;color:#333;width:40px;text-align:right;"></div>
+      </div>
+
+      <div class="legend">
+        <div class="legend-title" id="legendTitle">Inches of water equivalent</div>
+        <div class="legend-grid" id="legendGrid"></div>
+      </div>
+
+      <div class="err" id="err"></div>
+    </div>
+  </div>
+<script src="/config.js"></script>
 <script>
 (function () {
   const errBox=document.getElementById("err"),subtitle=document.getElementById("subtitle"),yearSel=document.getElementById("yearSel"),monthSel=document.getElementById("monthSel"),daySel=document.getElementById("daySel"),legendGrid=document.getElementById("legendGrid"),OPACITY=document.getElementById("opacity"),OPV=document.getElementById("opv"),cursorEl=document.getElementById("cursorReadout");
@@ -111,6 +154,34 @@
   const INITIAL_BOUNDS=[[-130.359201,29.915607],[-63.228204,60.840431]];
 
   let readoutsEnabled=false,lastKey="";
+  const GRID_RESOLUTION = 12;
+  const GRID_EXPAND_FRAC = 0.35;
+  const GRID_TIMEOUT_MS = 6000;
+  const POINT_TIMEOUT_MS = 2500;
+  
+  let gridAbort = null;
+  let gridFetchInProgress = false;
+  
+  function fetchWithTimeout(url, opts, ms){
+    const timeoutCtrl = new AbortController();
+    const t = setTimeout(() => timeoutCtrl.abort("timeout"), ms);
+  
+    const userSignal = opts && opts.signal ? opts.signal : null;
+  
+    let signal = timeoutCtrl.signal;
+    if (userSignal) {
+      const combo = new AbortController();
+      const onAbort = () => combo.abort("aborted");
+      userSignal.addEventListener("abort", onAbort, { once: true });
+      timeoutCtrl.signal.addEventListener("abort", onAbort, { once: true });
+      signal = combo.signal;
+    }
+  
+    const merged = Object.assign({}, opts || {}, { signal });
+    return fetch(url, merged).finally(() => clearTimeout(t));
+  }
+
+  function clampLat(lat){ return Math.max(-85, Math.min(85, lat)); }
 
   function showErr(msg){errBox.style.display="block";errBox.textContent=msg}
   function z2(n){return(n<10?"0":"")+n}
@@ -130,6 +201,19 @@
   if(typeof map.isRotating!=="function")map.isRotating=()=>false;
 
   const VALUE_BASE=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.VALUE_BASE)||window.location.origin;
+  // ===== HF TILE CONFIG (prevents ReferenceError + allows direct dataset reads) =====
+  const USE_HF_TILES = !!((window.__SNODAS_CONFIG__ && window.__SNODAS_CONFIG__.USE_HF_TILES) || false);
+
+  const HF_TILE_BASE =
+    (window.__SNODAS_CONFIG__ && window.__SNODAS_CONFIG__.HF_TILE_BASE) ||
+    (window.__SNODAS_CONFIG__ && window.__SNODAS_CONFIG__.HF_DATASET_REPO
+      ? ("https://huggingface.co/datasets/" + window.__SNODAS_CONFIG__.HF_DATASET_REPO + "/resolve/main")
+      : "");
+
+  function hfTileUrlTemplate(ymd, hours, dom){
+    dom = (dom || "zz").toLowerCase();
+    return HF_TILE_BASE + `/tilecache/bydate_${dom}_h${hours}_${ymd}_z{z}_{x}_{y}.png`;
+  }
 
   const CN_LINE_GLOW="cn_tracks_src_line_glow",CN_LINE="cn_tracks_src_line";
   const LAYER_ID="melt_layer",SRC_ID="melt_src";
@@ -203,8 +287,16 @@
   }
 
   function tileUrl(z,x,y,ymd,hours){
-    return `/tiles/forecast/by_date/${z}/${x}/${y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`;
+    if (USE_HF_TILES && HF_TILE_BASE) {
+      return hfTileUrlTemplate(ymd, hours, DOM)
+        .replace("{z}", String(z))
+        .replace("{x}", String(x))
+        .replace("{y}", String(y));
+    }
+    return `/tiles/forecast/by_date/${z}/${x}/${y}.png?date_yyyymmdd=${encodeURIComponent(ymd)}&hours=${encodeURIComponent(hours)}&dom=${encodeURIComponent(DOM)}`;
   }
+
+
 
   const prefetchPush=makeQueue(10);
   const prefetched=new Set();
@@ -269,7 +361,7 @@
       type: "vector",
       tiles: [`${VALUE_BASE}/cn_tiles/{z}/{x}/{y}.pbf`],
       minzoom: 0,
-      maxzoom: CN_MAX_ZOOM,
+      maxzoom: 7,
       bounds: [-170, 29, -63, 90]
     });
 
@@ -321,8 +413,12 @@
     cursorEl.style.display = "none";
     lastKey = "";
     
-    const tiles = [`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`];
-    
+    const tiles = [
+      (USE_HF_TILES && HF_TILE_BASE)
+        ? hfTileUrlTemplate(ymd, hours, DOM)
+        : `/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${encodeURIComponent(ymd)}&hours=${encodeURIComponent(hours)}&dom=${encodeURIComponent(DOM)}`
+    ];
+
     // Remove and re-add to force tile refresh
     if (map.getLayer(LAYER_ID)) {
       map.removeLayer(LAYER_ID);
@@ -439,10 +535,13 @@
 
   // ========== VIEWPORT GRID PREFETCH SYSTEM ==========
   let viewportGrid = null;
-  let gridFetchInProgress = false;
   let lastGridBounds = null;
+
   let lastGridKey = "";
   let pendingCursorUpdate = null;
+  let hoverSeq = 0;               // already exists later in your file; move it up and use it here
+  let lastHoverKey = "";          // prevents re-running for tiny mouse jitter
+  const HOVER_PIXEL_EPS = 2;      // ignore 1px jitter
 
   function shouldRefetchGrid() {
     if (!viewportGrid) return true;
@@ -477,67 +576,102 @@
     return false;
   }
 
-  async function fetchViewportGrid() {
-    if (gridFetchInProgress) return;
-    
+  async function fetchViewportGrid(){
     const ymd = selectedDateYMD();
     if (!ymd) return;
-    
+  
     const hours = getHours();
-    
+  
+    if (gridAbort) { try { gridAbort.abort(); } catch {} }
+    gridAbort = new AbortController();
+  
     gridFetchInProgress = true;
-    
-    try {
-      const viewBounds = map.getBounds();
-      const center = viewBounds.getCenter();
-      const lonSpan = viewBounds.getEast() - viewBounds.getWest();
-      const latSpan = viewBounds.getNorth() - viewBounds.getSouth();
-      
+  
+    try{
+      const b = map.getBounds();
+      const c = b.getCenter();
+      const lonSpan = (b.getEast() - b.getWest());
+      const latSpan = (b.getNorth() - b.getSouth());
+  
+      const expandLon = lonSpan * GRID_EXPAND_FRAC;
+      const expandLat = latSpan * GRID_EXPAND_FRAC;
+  
       const expandedBounds = [
-        center.lng - (lonSpan * 0.75),
-        center.lat - (latSpan * 0.75),
-        center.lng + (lonSpan * 0.75),
-        center.lat + (latSpan * 0.75)
+        c.lng - lonSpan/2 - expandLon,
+        clampLat(c.lat - latSpan/2 - expandLat),
+        c.lng + lonSpan/2 + expandLon,
+        clampLat(c.lat + latSpan/2 + expandLat),
       ];
-      
+  
       const payload = {
         date_yyyymmdd: ymd,
-        hours: hours,
+        hours,
         dom: DOM,
         bounds: expandedBounds,
-        resolution: 25
+        resolution: GRID_RESOLUTION
       };
-      
-      const r = await fetch(`${VALUE_BASE}/value/forecast/viewport_grid`, {
+  
+      const r = await fetchWithTimeout(`${VALUE_BASE}/value/forecast/viewport_grid`, {
         method: "POST",
-        headers: {"content-type": "application/json"},
+        headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
-        cache: "no-store"
-      });
-      
-      if (!r.ok) {
-        console.error(`[grid] fetch failed: ${r.status} ${r.statusText}`);
-        gridFetchInProgress = false;
-        return;
-      }
-      
+        cache: "no-store",
+        signal: gridAbort.signal
+      }, GRID_TIMEOUT_MS);
+  
+      if (!r.ok) throw new Error(`grid http ${r.status}`);
+  
       const data = await r.json();
-      
+  
       viewportGrid = data;
       lastGridBounds = data.bounds;
       lastGridKey = `${ymd}|${hours}`;
-      
-      console.log(`[grid] loaded ${data.resolution}x${data.resolution} grid for viewport`);
-      
-      if (pendingCursorUpdate) {
-        const {lngLat, point} = pendingCursorUpdate;
-        updateCursorReadout(lngLat, point);
+  
+    if (pendingCursorUpdate) {
+      const pu = pendingCursorUpdate;
+      // only refresh if it’s still the latest hover
+      if (pu.seq === hoverSeq) {
+        // call update again so it can use the grid immediately
+        updateCursorReadout({lng: pu.lngLat.lng, lat: pu.lngLat.lat}, {x: pu.point.x, y: pu.point.y}, pu.seq);
       }
-      
-    } catch (e) {
-      console.error("[grid] fetch error:", e);
-    } finally {
+    }
+    } catch(e){
+      // If aborted/timeout, just swallow; cursor fallback handles it.
+      // But do not leave pendingCursorUpdate stuck.
+      if (pendingCursorUpdate) {
+        const { point } = pendingCursorUpdate;
+        // clear “Loading…” if we can’t service it
+        showCursorReadout(point.x, point.y, "");
+        pendingCursorUpdate = null;
+      }
+    } finally{
       gridFetchInProgress = false;
+    }
+  }
+  async function fetchPointValueFast(ymd, hours, lon, lat){
+    const payload = { date_yyyymmdd: ymd, hours, dom: DOM, pts: [[lon, lat]] };
+  
+    try{
+      const r = await fetchWithTimeout(`${VALUE_BASE}/value/forecast/by_date_batch`, {
+        method: "POST",
+        headers: { "content-type":"application/json" },
+        body: JSON.stringify(payload),
+        cache: "no-store"
+      }, POINT_TIMEOUT_MS);
+  
+      if (!r.ok) return null;
+  
+      const j = await r.json();
+      const v = (j && j.values && j.values[0]) ? j.values[0] : null;
+  
+      const inches =
+        (v && typeof v.inches_1dp === "number") ? v.inches_1dp :
+        (v && typeof v.inches === "number") ? v.inches :
+        null;
+  
+      return (inches == null) ? null : inches;
+    } catch {
+      return null;
     }
   }
 
@@ -587,46 +721,59 @@
     return value;
   }
 
-  function updateCursorReadout(lngLat, point) {
-    if (map.getZoom() < CURSOR_ZMIN) {
-      showCursorReadout(point.x, point.y, "");
-      pendingCursorUpdate = null;
-      return;
-    }
-    
-    if (!tracksReady()) {
-      showCursorReadout(point.x, point.y, "");
-      pendingCursorUpdate = null;
-      return;
-    }
-    
-    if (!nearTrack(point, lngLat)) {
-      showCursorReadout(point.x, point.y, "");
-      pendingCursorUpdate = null;
-      return;
-    }
-    
-    if (gridFetchInProgress || shouldRefetchGrid()) {
-      showCursorReadout(point.x, point.y, "Loading...");
-      pendingCursorUpdate = {lngLat, point};
-      
-      if (shouldRefetchGrid()) {
-        fetchViewportGrid();
+   async function updateCursorReadout(lngLat, point, seq){
+    // If a newer hover happened, stop immediately
+    if (seq !== hoverSeq) return;
+  
+    if (map.getZoom() < CURSOR_ZMIN) { showCursorReadout(point.x, point.y, ""); return; }
+    if (!tracksReady()) { showCursorReadout(point.x, point.y, ""); return; }
+    if (!nearTrack(point, lngLat)) { showCursorReadout(point.x, point.y, ""); return; }
+  
+    const ymd = selectedDateYMD();
+    if (!ymd) { showCursorReadout(point.x, point.y, ""); return; }
+    const hours = getHours();
+  
+    // Build a stable request key: quantize lon/lat a bit so tiny moves don’t create new requests
+    const qLon = Math.round(lngLat.lng * 10000) / 10000; // ~11m at equator, fine for readout
+    const qLat = Math.round(lngLat.lat * 10000) / 10000;
+    const reqKey = `${ymd}|${hours}|${qLon}|${qLat}`;
+  
+    // If we already have a fresh grid that still covers the viewport, use it immediately
+    if (viewportGrid && !shouldRefetchGrid()) {
+      const v = interpolateFromGrid(lngLat.lng, lngLat.lat);
+      if (seq !== hoverSeq) return;
+  
+      if (v != null && v > TRACE_INCHES) {
+        showCursorReadout(point.x, point.y, v.toFixed(1) + " in");
+        return;
       }
-      return;
-    }
-    
-    const value = interpolateFromGrid(lngLat.lng, lngLat.lat);
-    
-    if (value === null || value <= TRACE_INCHES) {
       showCursorReadout(point.x, point.y, "");
-      pendingCursorUpdate = null;
       return;
     }
-    
-    showCursorReadout(point.x, point.y, value.toFixed(1) + " in");
+  
+    // Show loading, but bind it to THIS request key + seq
+    showCursorReadout(point.x, point.y, "Loading...");
+    pendingCursorUpdate = { seq, reqKey, lngLat: {lng: lngLat.lng, lat: lngLat.lat}, point: {x: point.x, y: point.y} };
+  
+    // Kick off a grid refresh in background (don’t await)
+    if (!gridFetchInProgress) fetchViewportGrid();
+  
+    // Fast fallback point request for responsiveness
+    const inches = await fetchPointValueFast(ymd, hours, lngLat.lng, lngLat.lat);
+  
+    // If user moved since we started, don’t overwrite
+    if (seq !== hoverSeq) return;
+    if (!pendingCursorUpdate || pendingCursorUpdate.reqKey !== reqKey || pendingCursorUpdate.seq !== seq) return;
+  
     pendingCursorUpdate = null;
+  
+    if (inches != null && inches > TRACE_INCHES) {
+      showCursorReadout(point.x, point.y, Number(inches).toFixed(1) + " in");
+    } else {
+      showCursorReadout(point.x, point.y, "");
+    }
   }
+  
 
   const debouncedGridFetch = debounce(fetchViewportGrid, 500);
 
@@ -656,11 +803,30 @@
       cursorEl.style.left = e.point.x + "px";
       cursorEl.style.top = e.point.y + "px";
     }
-    
+  
     if (!shouldReadout()) return;
     if (!tracksReady()) return;
-    
-    updateCursorReadout(e.lngLat, e.point);
+  
+    // Simple jitter gate so we don’t spam async calls on micro-moves
+    const px = Math.round(e.point.x);
+    const py = Math.round(e.point.y);
+    const ymd = selectedDateYMD();
+    const hours = getHours();
+    if (!ymd) return;
+  
+    const key = `${ymd}|${hours}|${px}|${py}`;
+    if (lastHoverKey) {
+      const parts = lastHoverKey.split("|");
+      const opx = parseInt(parts[2], 10);
+      const opy = parseInt(parts[3], 10);
+      if (Math.abs(px - opx) <= HOVER_PIXEL_EPS && Math.abs(py - opy) <= HOVER_PIXEL_EPS) {
+        return;
+      }
+    }
+    lastHoverKey = key;
+  
+    const mySeq = ++hoverSeq;
+    updateCursorReadout(e.lngLat, e.point, mySeq);
   });
 
   map.on("mouseout", () => {
