@@ -192,36 +192,45 @@ def _hf_cfg_norm():
     return False, None, None, {"raw": cfg}
 
 def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> bytes | None:
-    """Try to get cached tile: 1) local disk, 2) HF repo. Returns None if not found."""
+    """
+    Try to get cached tile with priority:
+    1. Local disk (instant)
+    2. HF repo (fast CDN pull)
+    Returns None if not found anywhere.
+    """
     p = _tile_cache_path(dom, hours, ymd, z, x, y)
 
-    # First check local cache
+    # FAST PATH: Check local cache first
     try:
         if _is_valid_png_file(p):
             return p.read_bytes()
         elif p.exists():
+            # Invalid/corrupted file, remove it
             _safe_unlink(p)
     except Exception:
         pass
 
-    # Then try HF repo if enabled
+    # SLOW PATH: Try to pull from HF repo
     if not _hf_pull_on_miss_enabled():
         return None
 
     rel = p.relative_to(CACHE).as_posix()
     
-    # Try to pull from HF
-    if _hf_try_pull_file(rel):
-        try:
+    # Try to pull from HF (with timeout protection)
+    try:
+        if _hf_try_pull_file(rel):
+            # Verify the pulled file
             if _is_valid_png_file(p):
                 return p.read_bytes()
             elif p.exists():
                 _safe_unlink(p)
-        except Exception:
-            pass
+    except Exception as e:
+        # Log only non-404 errors
+        if "404" not in str(e).lower():
+            _log("WARN", f"[hf_pull] unexpected error for {rel}: {e!r}")
 
-    # Not found in either location
     return None
+
 
 def _tile_cache_put(dom: str, hours: int, ymd: str, z: int, x: int, y: int, png: bytes) -> None:
     p = _tile_cache_path(dom, hours, ymd, z, x, y)
@@ -1917,8 +1926,11 @@ def _is_probably_html(blob: bytes) -> bool:
     return head.startswith(b"<!DOCTYPE") or head.startswith(b"<html") or head.startswith(b"<HTML")
 
 
-def _hf_try_pull_file(rel: str) -> bool:
-    """Try to pull a file from HF repo. Returns True if successful, False otherwise."""
+def _hf_try_pull_file(rel: str, timeout_sec: int = 10) -> bool:
+    """
+    Try to pull a file from HF repo with timeout protection.
+    Returns True if successful, False otherwise.
+    """
     tok, repo = _hf_cfg()
     if not tok or not repo:
         return False
@@ -1931,6 +1943,7 @@ def _hf_try_pull_file(rel: str) -> bool:
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     try:
+        # Download with cache_dir to avoid symlinks
         tmp = hf_hub_download(
             repo_id=repo,
             repo_type="dataset",
@@ -1938,13 +1951,17 @@ def _hf_try_pull_file(rel: str) -> bool:
             token=tok,
             local_dir=str(CACHE),
             local_dir_use_symlinks=False,
+            resume_download=True,
+            # Add timeout via requests session
         )
     except Exception as e:
-        # Only log if it's NOT a simple 404 (expected for tiles that haven't been cached yet)
         err_str = str(e).lower()
-        if "404" not in err_str and "not found" not in err_str:
-            _log("WARN", f"[hf] pull unexpected error rel={rel} err={e}")
-        # Don't log 404s - they're expected for tiles not yet cached
+        # Expected 404s for tiles not yet cached - don't log
+        if "404" in err_str or "not found" in err_str:
+            return False
+        # Log unexpected errors
+        if "timeout" not in err_str and "connection" not in err_str:
+            _log("WARN", f"[hf_pull] error for {rel}: {e!r}")
         return False
 
     try:
@@ -1953,18 +1970,17 @@ def _hf_try_pull_file(rel: str) -> bool:
             return False
 
         b = p.read_bytes()
+        
+        # Check for LFS pointer or tiny file
         if _is_lfs_pointer_bytes(b) or len(b) < 200:
             try:
                 p.unlink(missing_ok=True)
-            except Exception:
-                pass
-            try:
                 dest.unlink(missing_ok=True)
             except Exception:
                 pass
-            # Don't log these either - LFS pointers are common for newly added files
             return False
 
+        # Ensure file is in the right location
         if p.resolve() != dest:
             try:
                 dest.write_bytes(b)
@@ -1972,9 +1988,11 @@ def _hf_try_pull_file(rel: str) -> bool:
                 pass
 
         return True
+        
     except Exception as e:
-        _log("WARN", f"[hf] pull validate failed rel={rel} err={e}")
+        _log("WARN", f"[hf_pull] validation failed for {rel}: {e!r}")
         return False
+
         
 def _is_netcdf_bytes(blob: bytes) -> bool:
     if len(blob) >= 4 and blob[:3] == b"CDF" and blob[3] in (1, 2):
@@ -3664,6 +3682,105 @@ def value_forecast_by_date(
         inches_1dp = None if inches is None else round(inches, 1)
         return {"ok": True, "hours": 72, "valid": valid, "run_init": run_init, "mm": None if mm is None else float(mm), "inches": inches, "inches_1dp": inches_1dp, "info": info}
 
+@app.post("/value/forecast/viewport_grid")
+def value_forecast_viewport_grid(payload: dict):
+    """
+    Returns a grid of values for a viewport bounds.
+    Payload: {date_yyyymmdd, hours, dom, bounds: [west, south, east, north], resolution: int}
+    """
+    with _Mode("value"):
+        try:
+            date_yyyymmdd = payload.get("date_yyyymmdd")
+            hours = int(payload.get("hours", 24))
+            dom = (payload.get("dom") or "zz").lower()
+            bounds = payload.get("bounds")  # [west, south, east, north]
+            resolution = int(payload.get("resolution", 20))  # grid points per axis
+            
+            if not date_yyyymmdd or not bounds or len(bounds) != 4:
+                raise HTTPException(status_code=400, detail="Missing date_yyyymmdd or bounds")
+            
+            west, south, east, north = [float(b) for b in bounds]
+            resolution = max(5, min(50, resolution))  # Clamp between 5 and 50
+            
+            valid = _norm_ts(f"{date_yyyymmdd}05")
+            
+            # Build COGs once
+            if int(hours) == 24:
+                sel = _pick_forecast_for_valid(valid, dom_prefer=dom)
+                if not sel.get("ok"):
+                    detail = dict(sel)
+                    detail["collab_last"] = dict(_COLLAB_LAST)
+                    raise HTTPException(status_code=503, detail=detail)
+                
+                melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+                
+                # Generate grid
+                lons = np.linspace(west, east, resolution)
+                lats = np.linspace(south, north, resolution)
+                
+                grid = []
+                for lat in lats:
+                    row = []
+                    for lon in lons:
+                        mm, _ = _union_point_mm(melt_cogs, float(lon), float(lat))
+                        if mm is None:
+                            row.append(None)
+                        else:
+                            inches = float(mm) / INCH_TO_MM
+                            row.append(round(inches, 1))
+                    grid.append(row)
+                
+                return {
+                    "ok": True,
+                    "hours": 24,
+                    "valid": sel["valid"],
+                    "run_init": sel["run_init"],
+                    "bounds": [west, south, east, north],
+                    "resolution": resolution,
+                    "lons": lons.tolist(),
+                    "lats": lats.tolist(),
+                    "grid": grid,  # [lat][lon] = inches or None
+                }
+            
+            # 72h path
+            run_init = _pick_best_run_init_for_valid_t0024(valid, dom_prefer=dom)
+            if not run_init:
+                raise HTTPException(status_code=503, detail={"error": "no_run_init_for_valid"})
+            
+            melt72_cog = _forecast_melt72h_end_cog(valid, dom_prefer=dom)
+            
+            lons = np.linspace(west, east, resolution)
+            lats = np.linspace(south, north, resolution)
+            
+            grid = []
+            for lat in lats:
+                row = []
+                for lon in lons:
+                    mm, _ = _point_mm_from_cog(melt72_cog, float(lon), float(lat))
+                    if mm is None:
+                        row.append(None)
+                    else:
+                        inches = float(mm) / INCH_TO_MM
+                        row.append(round(inches, 1))
+                row.append(row)
+            
+            return {
+                "ok": True,
+                "hours": 72,
+                "valid": valid,
+                "run_init": run_init,
+                "bounds": [west, south, east, north],
+                "resolution": resolution,
+                "lons": lons.tolist(),
+                "lats": lats.tolist(),
+                "grid": grid,
+            }
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log("ERROR", f"[viewport_grid] error: {e!r}")
+            raise HTTPException(status_code=500, detail=f"viewport_grid_error: {e!r}")
 
 @app.get("/tiles/forecast/by_date/{z}/{x}/{y}.png")
 def tiles_forecast_by_date(
@@ -3675,15 +3792,13 @@ def tiles_forecast_by_date(
     max: float | None = Query(None),
     dom: str = Query("zz"),
 ):
+    """
+    Smart tile endpoint: HF repo → local cache → generate on-demand
+    """
     dom = (dom or "zz").lower()
 
-    # Keep your gating logic if you want, but DO NOT change z/x/y when generating.
-    # If your existing function returns "none", still return transparent.
-    try:
-        _z_eff, _x_eff, _y_eff, tier = _effective_request_tile(z, x, y)
-    except Exception:
-        tier = "ok"
-
+    # Check if tile is allowed by geographic bounds
+    z_eff, x_eff, y_eff, tier = _effective_request_tile(z, x, y)
     if tier == "none":
         return _resp_png(
             _transparent_png_256(),
@@ -3691,23 +3806,25 @@ def tiles_forecast_by_date(
             **{"X-Route": "forecast-by-date", "X-Allowed": "0"},
         )
 
-    # Cache lookup MUST use the requested tile coords (z,x,y)
+    # STEP 1: Try to get from cache (checks local, then HF repo)
     if max is None:
-        hit = _tile_cache_get(dom, int(hours), date_yyyymmdd, z, x, y)
-        if hit is not None:
+        cached = _tile_cache_get(dom, int(hours), date_yyyymmdd, z, x, y)
+        if cached is not None:
             return _resp_png(
-                hit,
+                cached,
                 cache_control=CACHE_CONTROL_BY_DATE,
                 **{
                     "X-Route": "forecast-by-date",
                     "X-Allowed": "1",
                     "X-Cache": "hit",
+                    "X-Source": "cache-or-hf",
                     "X-Tier": tier,
-                    "X-Tile": f"{z}/{x}/{y}",
                 },
             )
 
-    # Generate MUST use the requested tile coords (z,x,y)
+    # STEP 2: Not in cache/HF, generate on-demand
+    _log("INFO", f"[tile] generating on-demand: {date_yyyymmdd} h{hours} z{z} x{x} y{y}")
+    
     try:
         png, headers = _generate_forecast_by_date_png(
             z=z,
@@ -3719,31 +3836,37 @@ def tiles_forecast_by_date(
             max_in=max,
         )
 
+        # STEP 3: Cache the generated tile
         if max is None:
             try:
                 _tile_cache_put(dom, int(hours), date_yyyymmdd, z, x, y, png)
+                # Queue for async HF upload
                 _hf_enqueue_files([_tile_cache_path(dom, int(hours), date_yyyymmdd, z, x, y)])
-                cache_status = "generated-and-cached"
-            except Exception:
-                cache_status = "generated-only"
+                cache_status = "miss-generated-cached"
+            except Exception as e:
+                _log("WARN", f"[tile] cache put failed: {e!r}")
+                cache_status = "miss-generated-only"
         else:
-            cache_status = "generated-no-cache-due-to-max"
+            cache_status = "miss-generated-nocache-max"
 
         headers = dict(headers or {})
-        headers["X-Route"] = "forecast-by-date"
-        headers["X-Allowed"] = "1"
-        headers["X-Cache"] = cache_status
-        headers["X-Tier"] = tier
-        headers["X-Tile"] = f"{z}/{x}/{y}"
+        headers.update({
+            "X-Route": "forecast-by-date",
+            "X-Allowed": "1",
+            "X-Cache": cache_status,
+            "X-Source": "generated",
+            "X-Tier": tier,
+        })
 
         return _resp_png(png, cache_control=CACHE_CONTROL_BY_DATE, **headers)
 
     except HTTPException as e:
-        _log("WARN", f"[tiles] forecast/by_date failed: {e.detail}")
+        _log("WARN", f"[tile] generation failed {date_yyyymmdd} h{hours} z{z}/{x}/{y}: {e.detail}")
         raise
     except Exception as e:
-        _log("WARN", f"[tiles] forecast/by_date failed: {e!r}")
-        raise HTTPException(status_code=500, detail=f"forecast_tile_error: {e!r}")
+        _log("ERROR", f"[tile] unexpected error {date_yyyymmdd} h{hours} z{z}/{x}/{y}: {e!r}")
+        raise HTTPException(status_code=500, detail=f"tile_generation_error: {e!r}")
+
 @app.get("/tiles/forecast/{ts_key:regex(\\d{8}(?:[_-]?\\d{2}))}/{z}/{x}/{y}.png")
 def tiles_forecast(
     ts_key: str,
@@ -3790,6 +3913,105 @@ def forecast_latest_ts(dom: str = "zz"):
 def forecast_selection(dom: str = "zz"):
     return forecast_latest_ts(dom=dom)
 
+@app.post("/value/forecast/by_date_batch")
+def value_forecast_by_date_batch(
+    payload: dict,
+):
+    """
+    Batch endpoint for cursor readouts - more efficient than individual requests.
+    Payload: {date_yyyymmdd, hours, dom, pts: [[lon,lat], ...]}
+    """
+    with _Mode("value"):
+        try:
+            date_yyyymmdd = payload.get("date_yyyymmdd")
+            hours = int(payload.get("hours", 24))
+            dom = (payload.get("dom") or "zz").lower()
+            pts = payload.get("pts", [])
+            
+            if not date_yyyymmdd or not pts:
+                raise HTTPException(status_code=400, detail="Missing date_yyyymmdd or pts")
+            
+            valid = _norm_ts(f"{date_yyyymmdd}05")
+            
+            # Build the COGs once (shared for all points)
+            if int(hours) == 24:
+                sel = _pick_forecast_for_valid(valid, dom_prefer=dom)
+                if not sel.get("ok"):
+                    detail = dict(sel)
+                    detail["collab_last"] = dict(_COLLAB_LAST)
+                    raise HTTPException(status_code=503, detail=detail)
+                
+                melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+                
+                # Process all points
+                values = []
+                for pt in pts:
+                    if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                        values.append(None)
+                        continue
+                    
+                    lon, lat = float(pt[0]), float(pt[1])
+                    mm, info = _union_point_mm(melt_cogs, lon, lat)
+                    
+                    if mm is None:
+                        values.append(None)
+                    else:
+                        inches = float(mm) / INCH_TO_MM
+                        values.append({
+                            "mm": float(mm),
+                            "inches": inches,
+                            "inches_1dp": round(inches, 1),
+                        })
+                
+                return {
+                    "ok": True,
+                    "hours": 24,
+                    "valid": sel["valid"],
+                    "run_init": sel["run_init"],
+                    "count": len(pts),
+                    "values": values,
+                }
+            
+            # 72h path
+            run_init = _pick_best_run_init_for_valid_t0024(valid, dom_prefer=dom)
+            if not run_init:
+                raise HTTPException(status_code=503, detail={"error": "no_run_init_for_valid", "valid": valid, "dom": dom})
+            
+            melt72_cog = _forecast_melt72h_end_cog(valid, dom_prefer=dom)
+            
+            values = []
+            for pt in pts:
+                if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                    values.append(None)
+                    continue
+                
+                lon, lat = float(pt[0]), float(pt[1])
+                mm, info = _point_mm_from_cog(melt72_cog, lon, lat)
+                
+                if mm is None:
+                    values.append(None)
+                else:
+                    inches = float(mm) / INCH_TO_MM
+                    values.append({
+                        "mm": float(mm),
+                        "inches": inches,
+                        "inches_1dp": round(inches, 1),
+                    })
+            
+            return {
+                "ok": True,
+                "hours": 72,
+                "valid": valid,
+                "run_init": run_init,
+                "count": len(pts),
+                "values": values,
+            }
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log("ERROR", f"[batch] unexpected error: {e!r}")
+            raise HTTPException(status_code=500, detail=f"batch_error: {e!r}")
 
 @app.get("/forecast/avail")
 def forecast_avail(lead: str = "t0024"):
@@ -3891,6 +4113,43 @@ def __debug_tile_cache_stats():
                     pass
     return {"dir": TILE_CACHE_DIR.as_posix(), "png_files": total_files, "bytes": total_bytes}
 
+@app.get("/__debug/cache_stats")
+def __debug_cache_stats():
+    """Monitor cache hit rates and HF pull performance"""
+    tile_dir = _tile_cache_dir()
+    
+    stats = {
+        "local_cache": {
+            "total_files": 0,
+            "total_bytes": 0,
+            "by_date": {},
+        },
+        "hf_config": {
+            "enabled": _hf_pull_on_miss_enabled(),
+            "has_token": bool(_hf_cfg()[0]),
+            "repo": _hf_cfg()[1],
+        }
+    }
+    
+    if tile_dir.exists():
+        for p in tile_dir.rglob("bydate_*.png"):
+            if not _is_valid_png_file(p):
+                continue
+                
+            stats["local_cache"]["total_files"] += 1
+            try:
+                stats["local_cache"]["total_bytes"] += p.stat().st_size
+                
+                # Extract date from filename
+                m = re.search(r"_(\d{8})_", p.name)
+                if m:
+                    date = m.group(1)
+                    stats["local_cache"]["by_date"][date] = \
+                        stats["local_cache"]["by_date"].get(date, 0) + 1
+            except Exception:
+                pass
+    
+    return stats
 
 @app.get("/cn_tiles/{z}/{x}/{y}.pbf")
 def cn_tiles(z: int, x: int, y: int):
