@@ -144,11 +144,24 @@
 <script>
 (function () {
   const errBox=document.getElementById("err"),subtitle=document.getElementById("subtitle"),yearSel=document.getElementById("yearSel"),monthSel=document.getElementById("monthSel"),daySel=document.getElementById("daySel"),legendGrid=document.getElementById("legendGrid"),OPACITY=document.getElementById("opacity"),OPV=document.getElementById("opv"),cursorEl=document.getElementById("cursorReadout");
-  let ringAbort=null,ringGen=0,ringCenterKey="";
-  const DOM="zz",TRACE_INCHES=0.02,MIN_PIXEL_MOVE=2,MIN_REQUEST_GAP_MS=60,QUANT_DEG=0.01,ALPHA_GATE=false,CACHE_TTL_MS=120000,NEIGHBOR_PREFETCH=true;
+
+  const DOM="zz";
+  const TRACE_INCHES=0.02;
+  const MIN_PIXEL_MOVE=2;
+  const MIN_REQUEST_GAP_MS=60;
+  const QUANT_DEG=0.01;
+  const ALPHA_GATE=false;
+  const CACHE_TTL_MS=120000;
+
   const MIN_ZOOM_FOR_READOUT=9;
-  let readoutsEnabled=false,lastPoint=null,lastFire=0,rafPending=false,lastKey="",reqId=0;
-  const valCache=new Map(),inflight=new Set();
+  const CURSOR_ZMIN=9;
+  const PREFETCH_ZMIN=9;
+
+  const INITIAL_BOUNDS=[[-130.359201,29.915607],[-63.228204,60.840431]];
+
+  let readoutsEnabled=false,lastPoint=null,lastFire=0,rafPending=false,lastKey="";
+  const valCache=new Map();
+
   function showErr(msg){errBox.style.display="block";errBox.textContent=msg}
   function z2(n){return(n<10?"0":"")+n}
 
@@ -156,19 +169,35 @@
   if(!token){showErr("Missing MAPBOX_TOKEN. Check /config.js and server environment.");return}
   mapboxgl.accessToken=token;
 
-  const map=new mapboxgl.Map({container:"map",style:"mapbox://styles/mapbox/satellite-streets-v12",center:[-112.5,44.5],zoom:5});
+  const map=new mapboxgl.Map({
+    container:"map",
+    style:"mapbox://styles/mapbox/satellite-streets-v12",
+    bounds: INITIAL_BOUNDS,
+    fitBoundsOptions:{padding:40,duration:0,maxZoom:7}
+  });
+
   if(typeof map.isPitching!=="function")map.isPitching=()=>false;
   if(typeof map.isRotating!=="function")map.isRotating=()=>false;
 
   const VALUE_BASE=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.VALUE_BASE)||window.location.origin;
-  const CURSOR_ZMIN = 9;
-  const PREFETCH_ZMIN = 9;
 
-  const HF_DATASET_REPO=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.HF_DATASET_REPO)||"Jsinowitz/snodas-snowmelt-cache";
-  const HF_TILE_BASE=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.HF_TILE_BASE)||("https://huggingface.co/datasets/"+HF_DATASET_REPO+"/resolve/main");
-  const USE_HF_TILES = false;
-  const CN_SRC="cn_tracks_src",CN_LINE_GLOW="cn_tracks_src_line_glow",CN_LINE="cn_tracks_src_line";
+  const CN_LINE_GLOW="cn_tracks_src_line_glow",CN_LINE="cn_tracks_src_line";
   const LAYER_ID="melt_layer",SRC_ID="melt_src";
+
+  function tracksReady(){return !!(map.getLayer(CN_LINE)||map.getLayer(CN_LINE_GLOW))}
+
+  function nearTrack(point){
+    const layers=[];
+    if(map.getLayer(CN_LINE))layers.push(CN_LINE);
+    if(map.getLayer(CN_LINE_GLOW))layers.push(CN_LINE_GLOW);
+    if(!layers.length)return false;
+  
+    const r=6; // pixels
+    const box=[[point.x-r,point.y-r],[point.x+r,point.y+r]];
+    const feats=map.queryRenderedFeatures(box,{layers});
+    return !!(feats&&feats.length);
+  }
+
 
   function muteRoads(map){
     const style=map.getStyle(); if(!style||!style.layers)return;
@@ -198,76 +227,6 @@
     return{xmin,xmax,ymin,ymax}
   }
 
-  function hfTileUrlTemplate(ymd,hours,dom){
-    dom=(dom||"zz").toLowerCase();
-    return HF_TILE_BASE+`/tilecache/bydate_${dom}_h${hours}_${ymd}_z{z}_{x}_{y}.png`;
-  }
-
-  // Custom tile loading with fallback
-  function setupTileSourceWithFallback(ymd, hours) {
-    const dom = (DOM || "zz").toLowerCase();
-    
-    // Create a custom tile source that tries HF first, falls back to FastAPI
-    const customSource = {
-      type: 'raster',
-      tiles: [`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${dom}`],
-      tileSize: 256,
-      maxzoom: 12
-    };
-    
-    return customSource;
-  }
-  
-  function setTilesForSelection() {
-    const ymd = selectedDateYMD();
-    const hours = getHours();
-    if (!ymd) return;
-    
-    subtitle.textContent = subtitleText(ymd, hours);
-    renderLegend(hours);
-  
-    cursorEl.style.display = "none";
-    lastKey = "";
-    reqId++;
-    valCache.clear();
-    inflight.clear();
-    if (ringAbort) {
-      try { ringAbort.abort(); } catch {}
-    }
-    cursorPrefetchPush.clear();
-    ringCenterKey = "";
-    
-    const sourceConfig = setupTileSourceWithFallback(ymd, hours);
-    
-    if (map.getSource(SRC_ID)) {
-      map.getSource(SRC_ID).setTiles(sourceConfig.tiles);
-      map.triggerRepaint();
-      prefetched.clear();
-      prefetchViewportTiles();
-      return;
-    }
-    
-    map.addSource(SRC_ID, sourceConfig);
-    map.addLayer({
-      id: LAYER_ID,
-      type: 'raster',
-      source: SRC_ID,
-      paint: { 'raster-opacity': parseFloat(OPACITY.value) }
-    });
-    
-    if (map.getLayer(CN_LINE) && map.getLayer(LAYER_ID)) {
-      map.moveLayer(CN_LINE_GLOW, LAYER_ID);
-      map.moveLayer(CN_LINE, LAYER_ID);
-    }
-    
-    prefetched.clear();
-    prefetchViewportTiles();
-  }
-  
-  // Update tileUrl function to always use FastAPI
-  function tileUrl(z, x, y, ymd, hours) {
-    return `/tiles/forecast/by_date/${z}/${x}/${y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`;
-  }
   function makeQueue(limit){
     let active=0;const q=[];
     const run=()=>{while(active<limit&&q.length){const fn=q.shift();active++;Promise.resolve().then(fn).catch(()=>{}).finally(()=>{active--;run()})}};
@@ -276,40 +235,28 @@
     return push
   }
 
-  function startCursorRingPrefetch(ymd,hours,qLon,qLat){
-    const center=`${ymd}|${hours}|${qLon.toFixed(6)}|${qLat.toFixed(6)}`; if(center===ringCenterKey)return;
-    ringCenterKey=center;
-    if(ringAbort){try{ringAbort.abort()}catch{}}
-    ringAbort=new AbortController(); ringGen++; const myGen=ringGen;
-    cursorPrefetchPush.clear();
-    const step=QUANT_DEG,N=5,urls=[];
-    for(let i=1;i<=N;i++){
-      urls.push(`${VALUE_BASE}/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon+step*i}&lat=${qLat}&dom=${DOM}`);
-      urls.push(`${VALUE_BASE}/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon-step*i}&lat=${qLat}&dom=${DOM}`);
-      urls.push(`${VALUE_BASE}/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon}&lat=${qLat+step*i}&dom=${DOM}`);
-      urls.push(`${VALUE_BASE}/value/forecast/by_date?date_yyyymmdd=${ymd}&hours=${hours}&lon=${qLon}&lat=${qLat-step*i}&dom=${DOM}`);
-    }
-    for(const u of urls)cursorPrefetchPush(async()=>{if(myGen!==ringGen)return;try{await fetch(u,{cache:"force-cache",signal:ringAbort.signal})}catch{}})
+  function tileUrl(z,x,y,ymd,hours){
+    return `/tiles/forecast/by_date/${z}/${x}/${y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`;
   }
 
-  const prefetchPush=makeQueue(10),cursorPrefetchPush=makeQueue(16);
+  const prefetchPush=makeQueue(10);
   const prefetched=new Set();
 
-  function prefetchViewportTiles() {
-    if (map.getZoom() < PREFETCH_ZMIN) return;
-    const ymd = selectedDateYMD();
-    if (!ymd) return;
-    const hours = getHours();
-    const z0 = Math.max(0, Math.floor(map.getZoom()));
-    const maxZ = Math.min(12, z0 + 3);
-    const b = map.getBounds();
-    for (let z = z0 + 1; z <= maxZ; z++) {
-      const r = tileRangeForBounds(b, z);
-      for (let x = r.xmin; x <= r.xmax; x++) for (let y = r.ymin; y <= r.ymax; y++) {
-        const u = tileUrl(z, x, y, ymd, hours);
-        if (prefetched.has(u)) continue;
+  function prefetchViewportTiles(){
+    if(map.getZoom()<PREFETCH_ZMIN)return;
+    const ymd=selectedDateYMD();
+    if(!ymd)return;
+    const hours=getHours();
+    const z0=Math.max(0,Math.floor(map.getZoom()));
+    const maxZ=Math.min(12,z0+3);
+    const b=map.getBounds();
+    for(let z=z0+1;z<=maxZ;z++){
+      const r=tileRangeForBounds(b,z);
+      for(let x=r.xmin;x<=r.xmax;x++)for(let y=r.ymin;y<=r.ymax;y++){
+        const u=tileUrl(z,x,y,ymd,hours);
+        if(prefetched.has(u))continue;
         prefetched.add(u);
-        prefetchPush(() => fetch(u, { cache: "force-cache" }));
+        prefetchPush(()=>fetch(u,{cache:"force-cache"}));
       }
     }
   }
@@ -320,29 +267,14 @@
   map.on("load",()=>muteRoads(map));
   map.on("styledata",()=>muteRoads(map));
 
-
-  const LEGENDS = {
-    "24": {
-      colors: [
-        "#dcdcdc","#990000","#cc3333","#ff6666","#cccc66","#ff8c00","#ffff66","#99ff99","#00ff00",
-        "#66cc66","#6666ff","#3333cc","#000099","#990099","#4b0082","#2f004f","#000000"
-      ],
-      labels: [
-        "0.00 to trace","trace to 0.02","0.02 to 0.04","0.04 to 0.08","0.08 to 0.12","0.12 to 0.16",
-        "0.16 to 0.20","0.20 to 0.39","0.39 to 0.59","0.59 to 0.79","0.79 to 0.98","0.98 to 1.4",
-        "1.4 to 2.0","2.0 to 3.0","3.0 to 4.0","4.0 to 5.0","> 5.0"
-      ]
+  const LEGENDS={
+    "24":{
+      colors:["#dcdcdc","#990000","#cc3333","#ff6666","#cccc66","#ff8c00","#ffff66","#99ff99","#00ff00","#66cc66","#6666ff","#3333cc","#000099","#990099","#4b0082","#2f004f","#000000"],
+      labels:["0.00 to trace","trace to 0.02","0.02 to 0.04","0.04 to 0.08","0.08 to 0.12","0.12 to 0.16","0.16 to 0.20","0.20 to 0.39","0.39 to 0.59","0.59 to 0.79","0.79 to 0.98","0.98 to 1.4","1.4 to 2.0","2.0 to 3.0","3.0 to 4.0","4.0 to 5.0","> 5.0"]
     },
-    "72": {
-      colors: [
-        "#dcdcdc","#990000","#cc3333","#ff6666","#cccc66","#ff8c00","#ffff66","#99ff99","#00ff00",
-        "#66cc66","#6666ff","#3333cc","#000099","#990099","#4b0082","#2f004f","#000000"
-      ],
-      labels: [
-        "0.00 to trace","trace to 0.04","0.04 to 0.08","0.08 to 0.16","0.16 to 0.24","0.24 to 0.31",
-        "0.31 to 0.39","0.39 to 0.79","0.79 to 1.4","1.4 to 2.0","2.0 to 3.0","3.0 to 3.9",
-        "3.9 to 5.0","5.0 to 6.5","6.5 to 8.0","8.0 to 9.8","> 9.8"
-      ]
+    "72":{
+      colors:["#dcdcdc","#990000","#cc3333","#ff6666","#cccc66","#ff8c00","#ffff66","#99ff99","#00ff00","#66cc66","#6666ff","#3333cc","#000099","#990099","#4b0082","#2f004f","#000000"],
+      labels:["0.00 to trace","trace to 0.04","0.04 to 0.08","0.08 to 0.16","0.16 to 0.24","0.24 to 0.31","0.31 to 0.39","0.39 to 0.79","0.79 to 1.4","1.4 to 2.0","2.0 to 3.0","3.0 to 3.9","3.9 to 5.0","5.0 to 6.5","6.5 to 8.0","8.0 to 9.8","> 9.8"]
     }
   };
 
@@ -360,47 +292,97 @@
   function selectedDateYMD(){const y=yearSel.value,m=monthSel.value,d=daySel.value; if(!y||!m||!d)return null; return`${y}${m}${d}`}
   function subtitleText(yyyymmdd,hours){const y=yyyymmdd.slice(0,4),m=yyyymmdd.slice(4,6),d=yyyymmdd.slice(6,8);return`${hours} Hour snowmelt ending on ${y}-${m}-${d} 05Z`}
 
-  async function fetchCnGeojson(){const url="cn_tracks.geojson",r=await fetch(url,{cache:"no-store"});if(!r.ok)throw new Error(`fetch ${url} -> HTTP ${r.status}`);return await r.json()}
-
-  function geojsonBounds(gj){
-    let minLon=180,minLat=90,maxLon=-180,maxLat=-90;
-    function addCoord(c){if(!c||c.length<2)return;const lon=+c[0],lat=+c[1];if(!isFinite(lon)||!isFinite(lat))return;if(lon<minLon)minLon=lon;if(lat<minLat)minLat=lat;if(lon>maxLon)maxLon=lon;if(lat>maxLat)maxLat=lat}
-    function walk(coords){if(!coords)return;if(typeof coords[0]==="number"){addCoord(coords);return}for(const x of coords)walk(x)}
-    const feats=(gj&&gj.features)||[];
-    for(const f of feats){const g=f&&f.geometry;if(g&&g.coordinates)walk(g.coordinates)}
-    if(minLon>maxLon||minLat>maxLat)return null;
-    return[[minLon,minLat],[maxLon,maxLat]]
+  async function addCnTracksVectorTiles(){
+    const SRC="cn_tracks_vt";
+    if(map.getSource(SRC))return;
+  
+    map.addSource(SRC,{
+      type:"vector",
+      tiles:[`${VALUE_BASE}/cn_tiles/{z}/{x}/{y}.pbf`],
+      minzoom:0,
+      maxzoom:12
+    });
+  
+    map.addLayer({
+      id:CN_LINE_GLOW,
+      type:"line",
+      source:SRC,
+      "source-layer":"cn_tracks",
+      layout:{"line-join":"round","line-cap":"round"},
+      paint:{
+        "line-color":"#ff0000",
+        "line-opacity":0.85,
+        "line-blur":2.0,
+        "line-width":["interpolate",["linear"],["zoom"],4,2.0,6,4.0,8,6.0,10,8.0,12,10.0,14,12.0]
+      }
+    });
+  
+    map.addLayer({
+      id:CN_LINE,
+      type:"line",
+      source:SRC,
+      "source-layer":"cn_tracks",
+      layout:{"line-join":"round","line-cap":"round"},
+      paint:{
+        "line-color":"#ffffff",
+        "line-opacity":0.95,
+        "line-width":["interpolate",["linear"],["zoom"],4,0.8,6,1.6,8,2.4,10,3.2,12,4.0,14,4.8]
+      }
+    });
   }
 
-  let cnBbox=null;
-
-  async function addCnTracksFromGeojson(gj){
-    if(map.getSource(CN_SRC)){map.getSource(CN_SRC).setData(gj);return}
-    map.addSource(CN_SRC,{type:"geojson",data:gj});
-    map.addLayer({id:CN_LINE_GLOW,type:"line",source:CN_SRC,filter:["any",["==",["geometry-type"],"LineString"],["==",["geometry-type"],"MultiLineString"]],layout:{"line-join":"round","line-cap":"round"},paint:{"line-color":"#ff0000","line-opacity":0.85,"line-blur":2.0,"line-width":["interpolate",["linear"],["zoom"],4,2.0,6,4.0,8,6.0,10,8.0,12,10.0,14,12.0]}});
-    map.addLayer({id:CN_LINE,type:"line",source:CN_SRC,filter:["any",["==",["geometry-type"],"LineString"],["==",["geometry-type"],"MultiLineString"]],layout:{"line-join":"round","line-cap":"round"},paint:{"line-color":"#ffffff","line-opacity":0.95,"line-width":["interpolate",["linear"],["zoom"],4,0.8,6,1.6,8,2.4,10,3.2,12,4.0,14,4.8]}});
-  }
 
   function setOpacity(v){OPV.textContent=v.toFixed(2);if(map.getLayer(LAYER_ID))map.setPaintProperty(LAYER_ID,"raster-opacity",v)}
 
-  // function setTilesForSelection(){
-  //   const ymd=selectedDateYMD(),hours=getHours(); if(!ymd)return;
-  //   subtitle.textContent=subtitleText(ymd,hours);
-  //   renderLegend(hours);
+  let selGen=0;
 
-  //   const tiles = USE_HF_TILES
-  //     ? [hfTileUrlTemplate(ymd,hours,DOM)]
-  //     : [`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`];
+  function setTilesForSelection(){
+    const ymd=selectedDateYMD();
+    const hours=getHours();
+    if(!ymd)return;
 
-  //   cursorEl.style.display="none";lastKey="";reqId++;valCache.clear();inflight.clear();
-  //   if(ringAbort){try{ringAbort.abort()}catch{}}
-  //   cursorPrefetchPush.clear();ringCenterKey="";
-  //   if(map.getSource(SRC_ID)){map.getSource(SRC_ID).setTiles(tiles);map.triggerRepaint();prefetched.clear();prefetchViewportTiles();return}
-  //   map.addSource(SRC_ID,{type:"raster",tiles,tileSize:256,maxzoom:10});
-  //   map.addLayer({id:LAYER_ID,type:"raster",source:SRC_ID,paint:{"raster-opacity":parseFloat(OPACITY.value)}});
-  //   if(map.getLayer(CN_LINE)&&map.getLayer(LAYER_ID)){map.moveLayer(CN_LINE_GLOW,LAYER_ID);map.moveLayer(CN_LINE,LAYER_ID)}
-  //   prefetched.clear();prefetchViewportTiles();
-  // }
+    selGen++;
+    subtitle.textContent=subtitleText(ymd,hours);
+    renderLegend(hours);
+
+    cursorEl.style.display="none";
+    lastKey="";
+    valCache.clear();
+    batchPoints.clear();
+    recentReq.clear();
+    if(batchTimer){clearTimeout(batchTimer);batchTimer=null}
+
+    const sourceConfig={
+      type:"raster",
+      tiles:[`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`],
+      tileSize:256,
+      maxzoom:12
+    };
+
+    if(map.getSource(SRC_ID)){
+      map.getSource(SRC_ID).setTiles(sourceConfig.tiles);
+      map.triggerRepaint();
+      prefetched.clear();
+      prefetchViewportTiles();
+      return;
+    }
+
+    map.addSource(SRC_ID,sourceConfig);
+    map.addLayer({
+      id:LAYER_ID,
+      type:"raster",
+      source:SRC_ID,
+      paint:{"raster-opacity":parseFloat(OPACITY.value)}
+    });
+
+    if(map.getLayer(CN_LINE)&&map.getLayer(LAYER_ID)){
+      map.moveLayer(CN_LINE_GLOW,LAYER_ID);
+      map.moveLayer(CN_LINE,LAYER_ID);
+    }
+
+    prefetched.clear();
+    prefetchViewportTiles();
+  }
 
   function setSelectOptions(sel,options,value,disabledSet){
     sel.innerHTML="";
@@ -455,7 +437,13 @@
     setSelectOptions(yearSel,years.map(y=>({value:y,label:y})),years[years.length-1]);
     recomputeMonthOptions();recomputeDayOptions();
     const latest=available[available.length-1];
-    if(latest){yearSel.value=latest.slice(0,4);recomputeMonthOptions();monthSel.value=latest.slice(4,6);recomputeDayOptions();daySel.value=latest.slice(6,8)}
+    if(latest){
+      yearSel.value=latest.slice(0,4);
+      recomputeMonthOptions();
+      monthSel.value=latest.slice(4,6);
+      recomputeDayOptions();
+      daySel.value=latest.slice(6,8);
+    }
   }
 
   async function loadAvailable(){
@@ -469,9 +457,11 @@
   map.on("error",(e)=>showErr("Map error:\n"+(e&&e.error?e.error.message:String(e))));
 
   function showCursorReadout(px,py,text){
-    cursorEl.style.left=px+"px";cursorEl.style.top=py+"px";
+    cursorEl.style.left=px+"px";
+    cursorEl.style.top=py+"px";
     if(!text){cursorEl.style.display="none";return}
-    cursorEl.textContent=text;cursorEl.style.display="block";
+    cursorEl.textContent=text;
+    cursorEl.style.display="block";
   }
 
   function quantize(v,q){return Math.round(v/q)*q}
@@ -491,87 +481,113 @@
   }
   function cacheSet(key,txt){valCache.set(key,{t:Date.now(),txt})}
 
-  function neighborKeys(ymd,hours,qLon,qLat){
-    const step=QUANT_DEG,N=5,f=(lon,lat)=>`${ymd}|${hours}|${lon.toFixed(6)}|${lat.toFixed(6)}`,out=[];
-    for(let dx=-N;dx<=N;dx++)for(let dy=-N;dy<=N;dy++){
-      if(dx===0&&dy===0)continue;
-      if(Math.abs(dx)+Math.abs(dy)>N)continue;
-      out.push(f(qLon+dx*step,qLat+dy*step));
+  const BATCH_MS=120;
+  const BATCH_MAX=40;
+  const RECENT_REQ_MS=1500;
+
+  let batchTimer=null;
+  let batchPoints=new Map();
+  const recentReq=new Map();
+
+  let batchSupported=true;
+
+  function scheduleBatchSend(){
+    if(batchTimer)return;
+    batchTimer=setTimeout(()=>{batchTimer=null;sendBatch()},BATCH_MS);
+  }
+
+  function pruneRecent(now){
+    for(const [k,ts] of recentReq){
+      if(now-ts>5000)recentReq.delete(k);
     }
-    return out;
+  }
+
+  async function sendBatch(){
+    if(!batchSupported)return;
+
+    const ymd=selectedDateYMD();
+    if(!ymd)return;
+    const hours=getHours();
+
+    const items=Array.from(batchPoints.values()).slice(0,BATCH_MAX);
+    batchPoints.clear();
+    if(!items.length)return;
+
+    const myGen=selGen;
+    const payload={
+      date_yyyymmdd: ymd,
+      hours,
+      dom: DOM,
+      pts: items.map(it=>[it.lon,it.lat])
+    };
+
+    try{
+      const r=await fetch(`${VALUE_BASE}/value/forecast/by_date_batch`,{
+        method:"POST",
+        headers:{"content-type":"application/json"},
+        body:JSON.stringify(payload),
+        cache:"no-store"
+      });
+
+      if(r.status===404||r.status===405){batchSupported=false;return}
+      if(!r.ok)return;
+
+      const j=await r.json();
+      if(myGen!==selGen)return;
+
+      const values=(j&&j.values)?j.values:[];
+      for(let i=0;i<items.length;i++){
+        const it=items[i];
+        const v=values[i]||null;
+
+        const inches=
+          (v&&typeof v.inches_1dp==="number")?v.inches_1dp:
+          (v&&typeof v.inches==="number")?v.inches:
+          null;
+
+        const txt=(inches!=null&&inches>TRACE_INCHES)?(Number(inches).toFixed(1)+" in"):"";
+        const key=`${ymd}|${hours}|${it.lon.toFixed(6)}|${it.lat.toFixed(6)}`;
+        cacheSet(key,txt);
+
+        if(key===lastKey&&lastPoint){
+          showCursorReadout(lastPoint.point.x,lastPoint.point.y,txt);
+        }
+      }
+    } catch {}
   }
 
   function urlFor(ymd,hours,lon,lat){
-  return `${VALUE_BASE}/value/forecast/by_date` +
-    `?date_yyyymmdd=${encodeURIComponent(ymd)}` +
-    `&hours=${encodeURIComponent(hours)}` +
-    `&lon=${encodeURIComponent(lon)}` +
-    `&lat=${encodeURIComponent(lat)}` +
-    `&dom=${encodeURIComponent(DOM)}`;
-}
+    return `${VALUE_BASE}/value/forecast/by_date` +
+      `?date_yyyymmdd=${encodeURIComponent(ymd)}` +
+      `&hours=${encodeURIComponent(hours)}` +
+      `&lon=${encodeURIComponent(lon)}` +
+      `&lat=${encodeURIComponent(lat)}` +
+      `&dom=${encodeURIComponent(DOM)}`;
+  }
 
-async function fetchAndCache(ymd, hours, qLon, qLat, key, updateUi, point){
-  if(inflight.has(key)) return;
-  inflight.add(key);
-
-  const myReq = ++reqId;
-  const url = urlFor(ymd, hours, qLon, qLat);
-
-  const finish = (txt) => {
-    cacheSet(key, txt);
-    if(updateUi && point) showCursorReadout(point.x, point.y, txt);
-    inflight.delete(key);
-  };
-
-  try{
-    const r = await fetch(url, { cache: "no-store" });
-
-    if(myReq !== reqId){ inflight.delete(key); return; }
-
-    if(!r.ok){
-      finish("");
-      return;
-    }
-
-    let j = null;
-    const ct = (r.headers.get("content-type") || "").toLowerCase();
-
+  async function fetchSingleValue(ymd,hours,qLon,qLat){
+    const url=urlFor(ymd,hours,qLon,qLat);
+    const r=await fetch(url,{cache:"no-store"});
+    if(!r.ok)return "";
+    let j=null;
+    const ct=(r.headers.get("content-type")||"").toLowerCase();
     try{
       if(ct.includes("application/json")){
-        j = await r.json();
+        j=await r.json();
       } else {
-        const txt = (await r.text()).trim();
-        const n = Number(txt);
-        j = Number.isFinite(n) ? { inches: n } : null;
+        const txt=(await r.text()).trim();
+        const n=Number(txt);
+        j=Number.isFinite(n)?{inches:n}:null;
       }
-    } catch {
-      j = null;
-    }
+    } catch { j=null }
 
-    if(myReq !== reqId){ inflight.delete(key); return; }
-
-    const inches =
-      (j && typeof j.inches_1dp === "number") ? j.inches_1dp :
-      (j && typeof j.inches === "number") ? j.inches :
+    const inches=
+      (j&&typeof j.inches_1dp==="number")?j.inches_1dp:
+      (j&&typeof j.inches==="number")?j.inches:
       null;
 
-    const txt = (inches != null && inches > TRACE_INCHES) ? (Number(inches).toFixed(1) + " in") : "";
-    finish(txt);
-
-    if(NEIGHBOR_PREFETCH){
-      const nks = neighborKeys(ymd, hours, qLon, qLat);
-      for(const nk of nks){
-        if(valCache.has(nk) || inflight.has(nk)) continue;
-        const parts = nk.split("|"), lon = parseFloat(parts[2]), lat = parseFloat(parts[3]);
-        fetchAndCache(ymd, hours, lon, lat, nk, false, null);
-      }
-    }
-  } catch {
-    if(myReq !== reqId){ inflight.delete(key); return; }
-    finish("");
+    return (inches!=null&&inches>TRACE_INCHES)?(Number(inches).toFixed(1)+" in"):"";
   }
-}
-
 
   function shouldReadout(){
     const z=map.getZoom();
@@ -580,67 +596,78 @@ async function fetchAndCache(ymd, hours, qLon, qLat, key, updateUi, point){
       readoutsEnabled=false;
       lastKey="";
       showCursorReadout(0,0,"");
-      if(ringAbort){try{ringAbort.abort()}catch{}}
-      cursorPrefetchPush.clear();
-      ringCenterKey="";
-    } else if(ok&&!readoutsEnabled) readoutsEnabled=true;
+    } else if(ok&&!readoutsEnabled){
+      readoutsEnabled=true;
+    }
     return ok;
   }
 
-async function fetchValueAt(lngLat, point) {
-  if (map.getZoom() < CURSOR_ZMIN) {
-    showCursorReadout(point.x, point.y, "");
-    lastKey = "";
-    return;
+  async function fetchValueAt(lngLat,point){
+    if(map.getZoom()<CURSOR_ZMIN){showCursorReadout(point.x,point.y,"");lastKey="";return}
+
+    const ymd=selectedDateYMD();
+    if(!ymd){showCursorReadout(point.x,point.y,"");lastKey="";return}
+
+    if(!tracksReady()){showCursorReadout(point.x,point.y,"");lastKey="";return}
+    if(!nearTrack(point)){showCursorReadout(point.x,point.y,"");lastKey="";return}
+    if(pixelLooksEmpty(point)){showCursorReadout(point.x,point.y,"");lastKey="";return}
+
+    const hours=getHours();
+    const qLon=quantize(lngLat.lng,QUANT_DEG);
+    const qLat=quantize(lngLat.lat,QUANT_DEG);
+
+    const key=`${ymd}|${hours}|${qLon.toFixed(6)}|${qLat.toFixed(6)}`;
+    if(key===lastKey)return;
+    lastKey=key;
+
+    const cached=cacheGet(key);
+    if(cached!=null){showCursorReadout(point.x,point.y,cached);return}
+
+    const now=Date.now();
+    pruneRecent(now);
+    const lastTs=recentReq.get(key);
+    if(lastTs&&(now-lastTs)<RECENT_REQ_MS){showCursorReadout(point.x,point.y,"Loading...");return}
+    recentReq.set(key,now);
+
+    showCursorReadout(point.x,point.y,"Loading...");
+
+    if(!batchSupported){
+      const myGen=selGen;
+      try{
+        const txt=await fetchSingleValue(ymd,hours,qLon,qLat);
+        if(myGen!==selGen)return;
+        cacheSet(key,txt);
+        if(key===lastKey)showCursorReadout(point.x,point.y,txt);
+      } catch {
+        if(key===lastKey)showCursorReadout(point.x,point.y,"");
+      }
+      return;
+    }
+
+    const existing=batchPoints.get(key);
+    if(existing){
+      existing.point=point;
+    } else {
+      batchPoints.set(key,{lon:qLon,lat:qLat,point});
+    }
+    scheduleBatchSend();
   }
-
-  const ymd = selectedDateYMD();
-  if (!ymd) {
-    showCursorReadout(point.x, point.y, "");
-    lastKey = "";
-    return;
-  }
-
-  if (pixelLooksEmpty(point)) {
-    showCursorReadout(point.x, point.y, "");
-    lastKey = "";
-    return;
-  }
-
-  const hours = getHours();
-  const qLon = quantize(lngLat.lng, QUANT_DEG);
-  const qLat = quantize(lngLat.lat, QUANT_DEG);
-
-  startCursorRingPrefetch(ymd, hours, qLon, qLat);
-
-  const key = `${ymd}|${hours}|${qLon.toFixed(6)}|${qLat.toFixed(6)}`;
-  if (key === lastKey) return;
-  lastKey = key;
-
-  const cached = cacheGet(key);
-  if (cached != null) {
-    showCursorReadout(point.x, point.y, cached);
-    return;
-  }
-
-  showCursorReadout(point.x, point.y, "Loading...");
-
-  // Fire-and-forget is fine, because fetchAndCache now ALWAYS resolves the UI.
-  fetchAndCache(ymd, hours, qLon, qLat, key, true, point);
-}
-
 
   function maybeFire(){
     rafPending=false;
     if(!lastPoint)return;
     if(!shouldReadout())return;
+    if(!tracksReady())return;
+
     const now=Date.now();
     if(now-lastFire<MIN_REQUEST_GAP_MS)return;
+
     const{lngLat,point}=lastPoint;
     if(lastPoint.prevPoint){
       const dx=point.x-lastPoint.prevPoint.x,dy=point.y-lastPoint.prevPoint.y;
       if((dx*dx+dy*dy)<(MIN_PIXEL_MOVE*MIN_PIXEL_MOVE))return;
     }
+
     lastFire=now;
     fetchValueAt(lngLat,point);
     lastPoint.prevPoint=point;
@@ -649,6 +676,7 @@ async function fetchValueAt(lngLat, point) {
   map.on("mousemove",(e)=>{
     if(cursorEl.style.display!=="none"){cursorEl.style.left=e.point.x+"px";cursorEl.style.top=e.point.y+"px"}
     if(!shouldReadout()){lastPoint=null;return}
+    if(!tracksReady()){lastPoint=null;lastKey="";if(cursorEl.style.display!=="none")showCursorReadout(0,0,"");return}
     lastPoint={lngLat:e.lngLat,point:e.point,prevPoint:lastPoint?lastPoint.prevPoint:null};
     if(!rafPending){rafPending=true;requestAnimationFrame(maybeFire)}
   });
@@ -656,39 +684,35 @@ async function fetchValueAt(lngLat, point) {
   map.on("mouseout",()=>{
     lastKey="";
     showCursorReadout(0,0,"");
-    if(ringAbort){try{ringAbort.abort()}catch{}}
-    cursorPrefetchPush.clear();
-    ringCenterKey="";
+    batchPoints.clear();
+    if(batchTimer){clearTimeout(batchTimer);batchTimer=null}
   });
 
   map.on("zoomend",()=>{shouldReadout();prefetchDebounced()});
   map.on("moveend",prefetchDebounced);
-  map.on("zoomend", () => {
-    if (map.getZoom() < CURSOR_ZMIN) {
-      lastKey = "";
-      showCursorReadout(0,0,"");
-      if (ringAbort) { try { ringAbort.abort(); } catch {} }
-      cursorPrefetchPush.clear();
-      ringCenterKey = "";
-    }
+  map.on("zoomend",()=>{
+    if(map.getZoom()<CURSOR_ZMIN){lastKey="";showCursorReadout(0,0,"")}
     prefetchDebounced();
   });
 
   map.on("load",async()=>{
     try{
-      const gj=await fetchCnGeojson();
-      await addCnTracksFromGeojson(gj);
-      const b=geojsonBounds(gj);
-      if(b){cnBbox=b;map.fitBounds(b,{padding:40,duration:0,maxZoom:7})}
       renderLegend(24);
-      await loadAvailable();
+
+      const availPromise=loadAvailable();
+      await addCnTracksVectorTiles();
+
+      await availPromise;
       if(!available.length){showErr("No available days returned from /forecast/available_days");return}
+
       initSelectorsFromAvailable();
       setTilesForSelection();
       prefetchViewportTiles();
       setOpacity(parseFloat(OPACITY.value));
       shouldReadout();
-    }catch(e){showErr("Init error:\n"+String(e))}
+    } catch(e){
+      showErr("Init error:\n"+String(e));
+    }
   });
 
   yearSel.addEventListener("change",()=>{recomputeMonthOptions();recomputeDayOptions();setTilesForSelection()});
