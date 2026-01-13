@@ -186,17 +186,36 @@
 
   function tracksReady(){return !!(map.getLayer(CN_LINE)||map.getLayer(CN_LINE_GLOW))}
 
-  function nearTrack(point){
-    const layers=[];
-    if(map.getLayer(CN_LINE))layers.push(CN_LINE);
-    if(map.getLayer(CN_LINE_GLOW))layers.push(CN_LINE_GLOW);
-    if(!layers.length)return false;
+  const TRACK_CORRIDOR_MILES = 8;
+  const TRACK_CORRIDOR_PX_CAP = 90;
   
-    const r=6; // pixels
-    const box=[[point.x-r,point.y-r],[point.x+r,point.y+r]];
-    const feats=map.queryRenderedFeatures(box,{layers});
-    return !!(feats&&feats.length);
+  function milesToPixels(miles, latDeg, zoom){
+    const meters = miles * 1609.344;
+    const lat = latDeg * Math.PI / 180;
+    const metersPerPixel = 156543.03392 * Math.cos(lat) / Math.pow(2, zoom);
+    if (!isFinite(metersPerPixel) || metersPerPixel <= 0) return TRACK_CORRIDOR_PX_CAP;
+    return meters / metersPerPixel;
   }
+  
+  function nearTrack(point, lngLat){
+    const layers = [];
+    if (map.getLayer(CN_LINE)) layers.push(CN_LINE);
+    if (map.getLayer(CN_LINE_GLOW)) layers.push(CN_LINE_GLOW);
+    if (!layers.length) return false;
+  
+    const z = map.getZoom();
+    const rRaw = milesToPixels(TRACK_CORRIDOR_MILES, lngLat.lat, z);
+    const r = Math.max(6, Math.min(TRACK_CORRIDOR_PX_CAP, Math.round(rRaw)));
+  
+    const bbox = [
+      [point.x - r, point.y - r],
+      [point.x + r, point.y + r]
+    ];
+  
+    const feats = map.queryRenderedFeatures(bbox, { layers });
+    return !!(feats && feats.length);
+  }
+
 
 
   function muteRoads(map){
@@ -293,93 +312,134 @@
   function subtitleText(yyyymmdd,hours){const y=yyyymmdd.slice(0,4),m=yyyymmdd.slice(4,6),d=yyyymmdd.slice(6,8);return`${hours} Hour snowmelt ending on ${y}-${m}-${d} 05Z`}
 
   async function addCnTracksVectorTiles(){
-    const SRC="cn_tracks_vt";
-    if(map.getSource(SRC))return;
+    const SRC = "cn_tracks_vt";
+    const CN_MAX_ZOOM = 7;
   
-    map.addSource(SRC,{
-      type:"vector",
-      tiles:[`${VALUE_BASE}/cn_tiles/{z}/{x}/{y}.pbf`],
-      minzoom:0,
-      maxzoom:12
+    if (map.getSource(SRC)) return;
+  
+    map.addSource(SRC, {
+      type: "vector",
+      tiles: [`${VALUE_BASE}/cn_tiles/{z}/{x}/{y}.pbf`],
+      minzoom: 0,
+      maxzoom: CN_MAX_ZOOM
     });
   
     map.addLayer({
-      id:CN_LINE_GLOW,
-      type:"line",
-      source:SRC,
-      "source-layer":"cn_tracks",
-      layout:{"line-join":"round","line-cap":"round"},
-      paint:{
-        "line-color":"#ff0000",
-        "line-opacity":0.85,
-        "line-blur":2.0,
-        "line-width":["interpolate",["linear"],["zoom"],4,2.0,6,4.0,8,6.0,10,8.0,12,10.0,14,12.0]
+      id: CN_LINE_GLOW,
+      type: "line",
+      source: SRC,
+      "source-layer": "cn_tracks",
+      minzoom: 0,
+      maxzoom: 24,
+      layout: { "line-join": "round", "line-cap": "round" },
+      paint: {
+        "line-color": "#ff0000",
+        "line-opacity": 0.85,
+        "line-blur": 2.0,
+        "line-width": ["interpolate", ["linear"], ["zoom"], 4, 2.0, 6, 4.0, 8, 6.0, 10, 8.0, 12, 10.0, 14, 12.0]
       }
     });
   
     map.addLayer({
-      id:CN_LINE,
-      type:"line",
-      source:SRC,
-      "source-layer":"cn_tracks",
-      layout:{"line-join":"round","line-cap":"round"},
-      paint:{
-        "line-color":"#ffffff",
-        "line-opacity":0.95,
-        "line-width":["interpolate",["linear"],["zoom"],4,0.8,6,1.6,8,2.4,10,3.2,12,4.0,14,4.8]
+      id: CN_LINE,
+      type: "line",
+      source: SRC,
+      "source-layer": "cn_tracks",
+      minzoom: 0,
+      maxzoom: 24,
+      layout: { "line-join": "round", "line-cap": "round" },
+      paint: {
+        "line-color": "#ffffff",
+        "line-opacity": 0.95,
+        "line-width": ["interpolate", ["linear"], ["zoom"], 4, 0.8, 6, 1.6, 8, 2.4, 10, 3.2, 12, 4.0, 14, 4.8]
       }
     });
   }
-
+  
 
   function setOpacity(v){OPV.textContent=v.toFixed(2);if(map.getLayer(LAYER_ID))map.setPaintProperty(LAYER_ID,"raster-opacity",v)}
 
   let selGen=0;
 
+  // function setTilesForSelection(){
+  //   const ymd=selectedDateYMD();
+  //   const hours=getHours();
+  //   if(!ymd)return;
+
+  //   selGen++;
+  //   subtitle.textContent=subtitleText(ymd,hours);
+  //   renderLegend(hours);
+
+  //   cursorEl.style.display="none";
+  //   lastKey="";
+  //   valCache.clear();
+  //   batchPoints.clear();
+  //   recentReq.clear();
+  //   if(batchTimer){clearTimeout(batchTimer);batchTimer=null}
+
+  //   const sourceConfig={
+  //     type:"raster",
+  //     tiles:[`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`],
+  //     tileSize:256,
+  //     maxzoom:12
+  //   };
+
+  //   if(map.getSource(SRC_ID)){
+  //     map.getSource(SRC_ID).setTiles(sourceConfig.tiles);
+  //     map.triggerRepaint();
+  //     prefetched.clear();
+  //     prefetchViewportTiles();
+  //     return;
+  //   }
+
+  //   map.addSource(SRC_ID,sourceConfig);
+  //   map.addLayer({
+  //     id:LAYER_ID,
+  //     type:"raster",
+  //     source:SRC_ID,
+  //     paint:{"raster-opacity":parseFloat(OPACITY.value)}
+  //   });
+
+  //   if(map.getLayer(CN_LINE)&&map.getLayer(LAYER_ID)){
+  //     map.moveLayer(CN_LINE_GLOW,LAYER_ID);
+  //     map.moveLayer(CN_LINE,LAYER_ID);
+  //   }
+
+  //   prefetched.clear();
+  //   prefetchViewportTiles();
+  // }
+  const USE_HF_TILES = true;
+
+  function tilesTemplateForSelection(ymd, hours){
+    return USE_HF_TILES
+      ? [hfTileUrlTemplate(ymd, hours, DOM)]
+      : [`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`];
+  }
+
   function setTilesForSelection(){
-    const ymd=selectedDateYMD();
-    const hours=getHours();
-    if(!ymd)return;
-
-    selGen++;
-    subtitle.textContent=subtitleText(ymd,hours);
+    const ymd = selectedDateYMD(), hours = getHours();
+    if(!ymd) return;
+    subtitle.textContent = subtitleText(ymd, hours);
     renderLegend(hours);
+    // Define tile URL template for current selection
+    // const tiles = [
+    //   `/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`
+    // ];
+    const tiles = tilesTemplateForSelection(ymd, hours);
 
-    cursorEl.style.display="none";
-    lastKey="";
-    valCache.clear();
-    batchPoints.clear();
-    recentReq.clear();
-    if(batchTimer){clearTimeout(batchTimer);batchTimer=null}
-
-    const sourceConfig={
-      type:"raster",
-      tiles:[`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`],
-      tileSize:256,
-      maxzoom:12
-    };
-
+    // Remove any existing source/layer before adding new (if switching dates)
     if(map.getSource(SRC_ID)){
-      map.getSource(SRC_ID).setTiles(sourceConfig.tiles);
-      map.triggerRepaint();
-      prefetched.clear();
-      prefetchViewportTiles();
-      return;
+      map.removeLayer(LAYER_ID);
+      map.removeSource(SRC_ID);
     }
-
-    map.addSource(SRC_ID,sourceConfig);
-    map.addLayer({
-      id:LAYER_ID,
-      type:"raster",
-      source:SRC_ID,
-      paint:{"raster-opacity":parseFloat(OPACITY.value)}
-    });
-
-    if(map.getLayer(CN_LINE)&&map.getLayer(LAYER_ID)){
-      map.moveLayer(CN_LINE_GLOW,LAYER_ID);
-      map.moveLayer(CN_LINE,LAYER_ID);
+    // Add raster tile source with max zoom limit to prevent mosaic repeats
+    map.addSource(SRC_ID, { type: "raster", tiles: tiles, tileSize: 256, maxzoom: 12 });
+    map.addLayer({ id: LAYER_ID, type: "raster", source: SRC_ID, 
+                   paint: { "raster-opacity": parseFloat(OPACITY.value) } });
+    // Ensure the CN track lines are above the raster layer
+    if(map.getLayer(CN_LINE_GLOW) && map.getLayer(CN_LINE)){
+      map.moveLayer(LAYER_ID, CN_LINE_GLOW); // move raster layer below the track glow line
     }
-
     prefetched.clear();
     prefetchViewportTiles();
   }
@@ -609,7 +669,12 @@
     if(!ymd){showCursorReadout(point.x,point.y,"");lastKey="";return}
 
     if(!tracksReady()){showCursorReadout(point.x,point.y,"");lastKey="";return}
-    if(!nearTrack(point)){showCursorReadout(point.x,point.y,"");lastKey="";return}
+    if (!nearTrack(point, lngLat)) {
+      showCursorReadout(point.x, point.y, "");
+      lastKey = "";
+      return;
+    }
+
     if(pixelLooksEmpty(point)){showCursorReadout(point.x,point.y,"");lastKey="";return}
 
     const hours=getHours();
