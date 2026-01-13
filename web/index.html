@@ -96,62 +96,13 @@
     }
   </style>
 
-  <script src="/config.js"></script>
-</head>
-<body>
-  <div id="map"></div>
-  <div id="cursorReadout" class="cursor-readout"></div>
-
-  <div class="panel-stack">
-    <div class="panel-link">
-      <a href="https://accuweather.atlassian.net/wiki/spaces/AO/pages/3596288537/Snowmelt" id="confluenceLink" target="_blank" rel="noopener">Snowmelt Confluence</a>
-    </div>
-
-    <div class="panel" id="mainPanel">
-      <h3>CN Snowmelt</h3>
-      <div class="sub" id="subtitle">Loading…</div>
-
-      <div class="pickrow">
-        <select id="yearSel"></select>
-        <select id="monthSel"></select>
-        <select id="daySel"></select>
-      </div>
-
-      <div class="row">
-        <input type="radio" name="hours" id="h24" value="24" checked>
-        <label for="h24">24 Hour Snowmelt</label>
-      </div>
-      <div class="row">
-        <input type="radio" name="hours" id="h72" value="72">
-        <label for="h72">72 Hour Snowmelt</label>
-      </div>
-
-      <div class="sliderrow">
-        <div style="font-size:13px;">Opacity</div>
-        <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.80" />
-        <div id="opv" style="font-size:12px;color:#333;width:40px;text-align:right;"></div>
-      </div>
-
-      <div class="legend">
-        <div class="legend-title" id="legendTitle">Inches of water equivalent</div>
-        <div class="legend-grid" id="legendGrid"></div>
-      </div>
-
-      <div class="err" id="err"></div>
-    </div>
-  </div>
-
 <script>
 (function () {
   const errBox=document.getElementById("err"),subtitle=document.getElementById("subtitle"),yearSel=document.getElementById("yearSel"),monthSel=document.getElementById("monthSel"),daySel=document.getElementById("daySel"),legendGrid=document.getElementById("legendGrid"),OPACITY=document.getElementById("opacity"),OPV=document.getElementById("opv"),cursorEl=document.getElementById("cursorReadout");
 
   const DOM="zz";
   const TRACE_INCHES=0.02;
-  const MIN_PIXEL_MOVE=2;
-  const MIN_REQUEST_GAP_MS=60;
-  const QUANT_DEG=0.01;
   const ALPHA_GATE=false;
-  const CACHE_TTL_MS=120000;
 
   const MIN_ZOOM_FOR_READOUT=9;
   const CURSOR_ZMIN=9;
@@ -159,8 +110,7 @@
 
   const INITIAL_BOUNDS=[[-130.359201,29.915607],[-63.228204,60.840431]];
 
-  let readoutsEnabled=false,lastPoint=null,lastFire=0,rafPending=false,lastKey="";
-  const valCache=new Map();
+  let readoutsEnabled=false,lastKey="";
 
   function showErr(msg){errBox.style.display="block";errBox.textContent=msg}
   function z2(n){return(n<10?"0":"")+n}
@@ -215,8 +165,6 @@
     const feats = map.queryRenderedFeatures(bbox, { layers });
     return !!(feats && feats.length);
   }
-
-
 
   function muteRoads(map){
     const style=map.getStyle(); if(!style||!style.layers)return;
@@ -314,16 +262,17 @@
   async function addCnTracksVectorTiles(){
     const SRC = "cn_tracks_vt";
     const CN_MAX_ZOOM = 7;
-  
+
     if (map.getSource(SRC)) return;
-  
+
     map.addSource(SRC, {
       type: "vector",
       tiles: [`${VALUE_BASE}/cn_tiles/{z}/{x}/{y}.pbf`],
       minzoom: 0,
-      maxzoom: CN_MAX_ZOOM
+      maxzoom: CN_MAX_ZOOM,
+      bounds: [-170, 29, -63, 90]
     });
-  
+
     map.addLayer({
       id: CN_LINE_GLOW,
       type: "line",
@@ -339,7 +288,7 @@
         "line-width": ["interpolate", ["linear"], ["zoom"], 4, 2.0, 6, 4.0, 8, 6.0, 10, 8.0, 12, 10.0, 14, 12.0]
       }
     });
-  
+
     map.addLayer({
       id: CN_LINE,
       type: "line",
@@ -355,91 +304,57 @@
       }
     });
   }
-  
 
   function setOpacity(v){OPV.textContent=v.toFixed(2);if(map.getLayer(LAYER_ID))map.setPaintProperty(LAYER_ID,"raster-opacity",v)}
 
   let selGen=0;
 
-  // function setTilesForSelection(){
-  //   const ymd=selectedDateYMD();
-  //   const hours=getHours();
-  //   if(!ymd)return;
-
-  //   selGen++;
-  //   subtitle.textContent=subtitleText(ymd,hours);
-  //   renderLegend(hours);
-
-  //   cursorEl.style.display="none";
-  //   lastKey="";
-  //   valCache.clear();
-  //   batchPoints.clear();
-  //   recentReq.clear();
-  //   if(batchTimer){clearTimeout(batchTimer);batchTimer=null}
-
-  //   const sourceConfig={
-  //     type:"raster",
-  //     tiles:[`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`],
-  //     tileSize:256,
-  //     maxzoom:12
-  //   };
-
-  //   if(map.getSource(SRC_ID)){
-  //     map.getSource(SRC_ID).setTiles(sourceConfig.tiles);
-  //     map.triggerRepaint();
-  //     prefetched.clear();
-  //     prefetchViewportTiles();
-  //     return;
-  //   }
-
-  //   map.addSource(SRC_ID,sourceConfig);
-  //   map.addLayer({
-  //     id:LAYER_ID,
-  //     type:"raster",
-  //     source:SRC_ID,
-  //     paint:{"raster-opacity":parseFloat(OPACITY.value)}
-  //   });
-
-  //   if(map.getLayer(CN_LINE)&&map.getLayer(LAYER_ID)){
-  //     map.moveLayer(CN_LINE_GLOW,LAYER_ID);
-  //     map.moveLayer(CN_LINE,LAYER_ID);
-  //   }
-
-  //   prefetched.clear();
-  //   prefetchViewportTiles();
-  // }
-  const USE_HF_TILES = true;
-
-  function tilesTemplateForSelection(ymd, hours){
-    return USE_HF_TILES
-      ? [hfTileUrlTemplate(ymd, hours, DOM)]
-      : [`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`];
-  }
-
   function setTilesForSelection(){
-    const ymd = selectedDateYMD(), hours = getHours();
+    const ymd = selectedDateYMD();
+    const hours = getHours();
     if(!ymd) return;
+    
+    selGen++;
     subtitle.textContent = subtitleText(ymd, hours);
     renderLegend(hours);
-    // Define tile URL template for current selection
-    // const tiles = [
-    //   `/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`
-    // ];
-    const tiles = tilesTemplateForSelection(ymd, hours);
-
-    // Remove any existing source/layer before adding new (if switching dates)
-    if(map.getSource(SRC_ID)){
+    
+    cursorEl.style.display = "none";
+    lastKey = "";
+    
+    const tiles = [`/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${ymd}&hours=${hours}&dom=${DOM}`];
+    
+    // Remove and re-add to force tile refresh
+    if (map.getLayer(LAYER_ID)) {
       map.removeLayer(LAYER_ID);
+    }
+    if (map.getSource(SRC_ID)) {
       map.removeSource(SRC_ID);
     }
-    // Add raster tile source with max zoom limit to prevent mosaic repeats
-    map.addSource(SRC_ID, { type: "raster", tiles: tiles, tileSize: 256, maxzoom: 12 });
-    map.addLayer({ id: LAYER_ID, type: "raster", source: SRC_ID, 
-                   paint: { "raster-opacity": parseFloat(OPACITY.value) } });
-    // Ensure the CN track lines are above the raster layer
-    if(map.getLayer(CN_LINE_GLOW) && map.getLayer(CN_LINE)){
-      map.moveLayer(LAYER_ID, CN_LINE_GLOW); // move raster layer below the track glow line
-    }
+    
+    // Small delay to ensure removal completes
+    setTimeout(() => {
+      map.addSource(SRC_ID, {
+        type: "raster",
+        tiles: tiles,
+        tileSize: 256,
+        maxzoom: 12,
+        bounds: [-170, 29, -40, 90]
+      });
+      
+      map.addLayer({
+        id: LAYER_ID,
+        type: "raster",
+        source: SRC_ID,
+        paint: {
+          "raster-opacity": parseFloat(OPACITY.value)
+        }
+      });
+      
+      if (map.getLayer(CN_LINE_GLOW)) {
+        map.moveLayer(LAYER_ID, CN_LINE_GLOW);
+      }
+    }, 50);
+    
     prefetched.clear();
     prefetchViewportTiles();
   }
@@ -514,8 +429,6 @@
     return j;
   }
 
-  map.on("error",(e)=>showErr("Map error:\n"+(e&&e.error?e.error.message:String(e))));
-
   function showCursorReadout(px,py,text){
     cursorEl.style.left=px+"px";
     cursorEl.style.top=py+"px";
@@ -524,129 +437,205 @@
     cursorEl.style.display="block";
   }
 
-  function quantize(v,q){return Math.round(v/q)*q}
+  // ========== VIEWPORT GRID PREFETCH SYSTEM ==========
+  let viewportGrid = null;
+  let gridFetchInProgress = false;
+  let lastGridBounds = null;
+  let lastGridKey = "";
+  let pendingCursorUpdate = null;
 
-  function pixelLooksEmpty(point){
-    if(!ALPHA_GATE)return false;
-    if(!map.getLayer(LAYER_ID))return false;
-    const f=map.queryRenderedFeatures(point,{layers:[LAYER_ID]});
-    return(!f||!f.length);
+  function shouldRefetchGrid() {
+    if (!viewportGrid) return true;
+    
+    const ymd = selectedDateYMD();
+    const hours = getHours();
+    const dateKey = `${ymd}|${hours}`;
+    
+    if (lastGridKey !== dateKey) return true;
+    
+    if (!lastGridBounds) return true;
+    
+    const currentBounds = map.getBounds();
+    const cw = currentBounds.getWest();
+    const cs = currentBounds.getSouth();
+    const ce = currentBounds.getEast();
+    const cn = currentBounds.getNorth();
+    
+    const gw = lastGridBounds[0];
+    const gs = lastGridBounds[1];
+    const ge = lastGridBounds[2];
+    const gn = lastGridBounds[3];
+    
+    const lonBuffer = (ge - gw) * 0.2;
+    const latBuffer = (gn - gs) * 0.2;
+    
+    if (cw < gw + lonBuffer || ce > ge - lonBuffer || 
+        cs < gs + latBuffer || cn > gn - latBuffer) {
+      return true;
+    }
+    
+    return false;
   }
 
-  function cacheGet(key){
-    const v=valCache.get(key);
-    if(!v)return null;
-    if(Date.now()-v.t>CACHE_TTL_MS){valCache.delete(key);return null}
-    return v.txt;
-  }
-  function cacheSet(key,txt){valCache.set(key,{t:Date.now(),txt})}
-
-  const BATCH_MS=120;
-  const BATCH_MAX=40;
-  const RECENT_REQ_MS=1500;
-
-  let batchTimer=null;
-  let batchPoints=new Map();
-  const recentReq=new Map();
-
-  let batchSupported=true;
-
-  function scheduleBatchSend(){
-    if(batchTimer)return;
-    batchTimer=setTimeout(()=>{batchTimer=null;sendBatch()},BATCH_MS);
-  }
-
-  function pruneRecent(now){
-    for(const [k,ts] of recentReq){
-      if(now-ts>5000)recentReq.delete(k);
+  async function fetchViewportGrid() {
+    if (gridFetchInProgress) return;
+    
+    const ymd = selectedDateYMD();
+    if (!ymd) return;
+    
+    const hours = getHours();
+    
+    gridFetchInProgress = true;
+    
+    try {
+      const viewBounds = map.getBounds();
+      const center = viewBounds.getCenter();
+      const lonSpan = viewBounds.getEast() - viewBounds.getWest();
+      const latSpan = viewBounds.getNorth() - viewBounds.getSouth();
+      
+      const expandedBounds = [
+        center.lng - (lonSpan * 0.75),
+        center.lat - (latSpan * 0.75),
+        center.lng + (lonSpan * 0.75),
+        center.lat + (latSpan * 0.75)
+      ];
+      
+      const payload = {
+        date_yyyymmdd: ymd,
+        hours: hours,
+        dom: DOM,
+        bounds: expandedBounds,
+        resolution: 25
+      };
+      
+      const r = await fetch(`${VALUE_BASE}/value/forecast/viewport_grid`, {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify(payload),
+        cache: "no-store"
+      });
+      
+      if (!r.ok) {
+        console.error(`[grid] fetch failed: ${r.status} ${r.statusText}`);
+        gridFetchInProgress = false;
+        return;
+      }
+      
+      const data = await r.json();
+      
+      viewportGrid = data;
+      lastGridBounds = data.bounds;
+      lastGridKey = `${ymd}|${hours}`;
+      
+      console.log(`[grid] loaded ${data.resolution}x${data.resolution} grid for viewport`);
+      
+      if (pendingCursorUpdate) {
+        const {lngLat, point} = pendingCursorUpdate;
+        updateCursorReadout(lngLat, point);
+      }
+      
+    } catch (e) {
+      console.error("[grid] fetch error:", e);
+    } finally {
+      gridFetchInProgress = false;
     }
   }
 
-  async function sendBatch(){
-    if(!batchSupported)return;
-
-    const ymd=selectedDateYMD();
-    if(!ymd)return;
-    const hours=getHours();
-
-    const items=Array.from(batchPoints.values()).slice(0,BATCH_MAX);
-    batchPoints.clear();
-    if(!items.length)return;
-
-    const myGen=selGen;
-    const payload={
-      date_yyyymmdd: ymd,
-      hours,
-      dom: DOM,
-      pts: items.map(it=>[it.lon,it.lat])
-    };
-
-    try{
-      const r=await fetch(`${VALUE_BASE}/value/forecast/by_date_batch`,{
-        method:"POST",
-        headers:{"content-type":"application/json"},
-        body:JSON.stringify(payload),
-        cache:"no-store"
-      });
-
-      if(r.status===404||r.status===405){batchSupported=false;return}
-      if(!r.ok)return;
-
-      const j=await r.json();
-      if(myGen!==selGen)return;
-
-      const values=(j&&j.values)?j.values:[];
-      for(let i=0;i<items.length;i++){
-        const it=items[i];
-        const v=values[i]||null;
-
-        const inches=
-          (v&&typeof v.inches_1dp==="number")?v.inches_1dp:
-          (v&&typeof v.inches==="number")?v.inches:
-          null;
-
-        const txt=(inches!=null&&inches>TRACE_INCHES)?(Number(inches).toFixed(1)+" in"):"";
-        const key=`${ymd}|${hours}|${it.lon.toFixed(6)}|${it.lat.toFixed(6)}`;
-        cacheSet(key,txt);
-
-        if(key===lastKey&&lastPoint){
-          showCursorReadout(lastPoint.point.x,lastPoint.point.y,txt);
-        }
+  function interpolateFromGrid(lon, lat) {
+    if (!viewportGrid || !viewportGrid.grid) return null;
+    
+    const {lons, lats, grid} = viewportGrid;
+    
+    let lonIdx = -1, latIdx = -1;
+    
+    for (let i = 0; i < lons.length - 1; i++) {
+      if (lon >= lons[i] && lon <= lons[i + 1]) {
+        lonIdx = i;
+        break;
       }
-    } catch {}
+    }
+    
+    for (let i = 0; i < lats.length - 1; i++) {
+      if (lat >= lats[i] && lat <= lats[i + 1]) {
+        latIdx = i;
+        break;
+      }
+    }
+    
+    if (lonIdx === -1 || latIdx === -1) return null;
+    
+    const v00 = grid[latIdx][lonIdx];
+    const v10 = grid[latIdx][lonIdx + 1];
+    const v01 = grid[latIdx + 1][lonIdx];
+    const v11 = grid[latIdx + 1][lonIdx + 1];
+    
+    if (v00 === null && v10 === null && v01 === null && v11 === null) {
+      return null;
+    }
+    
+    if (v00 === null || v10 === null || v01 === null || v11 === null) {
+      return v00 ?? v10 ?? v01 ?? v11;
+    }
+    
+    const lonFrac = (lon - lons[lonIdx]) / (lons[lonIdx + 1] - lons[lonIdx]);
+    const latFrac = (lat - lats[latIdx]) / (lats[latIdx + 1] - lats[latIdx]);
+    
+    const v0 = v00 * (1 - lonFrac) + v10 * lonFrac;
+    const v1 = v01 * (1 - lonFrac) + v11 * lonFrac;
+    const value = v0 * (1 - latFrac) + v1 * latFrac;
+    
+    return value;
   }
 
-  function urlFor(ymd,hours,lon,lat){
-    return `${VALUE_BASE}/value/forecast/by_date` +
-      `?date_yyyymmdd=${encodeURIComponent(ymd)}` +
-      `&hours=${encodeURIComponent(hours)}` +
-      `&lon=${encodeURIComponent(lon)}` +
-      `&lat=${encodeURIComponent(lat)}` +
-      `&dom=${encodeURIComponent(DOM)}`;
+  function updateCursorReadout(lngLat, point) {
+    if (map.getZoom() < CURSOR_ZMIN) {
+      showCursorReadout(point.x, point.y, "");
+      pendingCursorUpdate = null;
+      return;
+    }
+    
+    if (!tracksReady()) {
+      showCursorReadout(point.x, point.y, "");
+      pendingCursorUpdate = null;
+      return;
+    }
+    
+    if (!nearTrack(point, lngLat)) {
+      showCursorReadout(point.x, point.y, "");
+      pendingCursorUpdate = null;
+      return;
+    }
+    
+    if (gridFetchInProgress || shouldRefetchGrid()) {
+      showCursorReadout(point.x, point.y, "Loading...");
+      pendingCursorUpdate = {lngLat, point};
+      
+      if (shouldRefetchGrid()) {
+        fetchViewportGrid();
+      }
+      return;
+    }
+    
+    const value = interpolateFromGrid(lngLat.lng, lngLat.lat);
+    
+    if (value === null || value <= TRACE_INCHES) {
+      showCursorReadout(point.x, point.y, "");
+      pendingCursorUpdate = null;
+      return;
+    }
+    
+    showCursorReadout(point.x, point.y, value.toFixed(1) + " in");
+    pendingCursorUpdate = null;
   }
 
-  async function fetchSingleValue(ymd,hours,qLon,qLat){
-    const url=urlFor(ymd,hours,qLon,qLat);
-    const r=await fetch(url,{cache:"no-store"});
-    if(!r.ok)return "";
-    let j=null;
-    const ct=(r.headers.get("content-type")||"").toLowerCase();
-    try{
-      if(ct.includes("application/json")){
-        j=await r.json();
-      } else {
-        const txt=(await r.text()).trim();
-        const n=Number(txt);
-        j=Number.isFinite(n)?{inches:n}:null;
-      }
-    } catch { j=null }
+  const debouncedGridFetch = debounce(fetchViewportGrid, 500);
 
-    const inches=
-      (j&&typeof j.inches_1dp==="number")?j.inches_1dp:
-      (j&&typeof j.inches==="number")?j.inches:
-      null;
-
-    return (inches!=null&&inches>TRACE_INCHES)?(Number(inches).toFixed(1)+" in"):"";
+  function onSelectionChange() {
+    viewportGrid = null;
+    lastGridBounds = null;
+    lastGridKey = "";
+    pendingCursorUpdate = null;
+    fetchViewportGrid();
   }
 
   function shouldReadout(){
@@ -662,102 +651,41 @@
     return ok;
   }
 
-  async function fetchValueAt(lngLat,point){
-    if(map.getZoom()<CURSOR_ZMIN){showCursorReadout(point.x,point.y,"");lastKey="";return}
-
-    const ymd=selectedDateYMD();
-    if(!ymd){showCursorReadout(point.x,point.y,"");lastKey="";return}
-
-    if(!tracksReady()){showCursorReadout(point.x,point.y,"");lastKey="";return}
-    if (!nearTrack(point, lngLat)) {
-      showCursorReadout(point.x, point.y, "");
-      lastKey = "";
-      return;
+  map.on("mousemove", (e) => {
+    if (cursorEl.style.display !== "none") {
+      cursorEl.style.left = e.point.x + "px";
+      cursorEl.style.top = e.point.y + "px";
     }
-
-    if(pixelLooksEmpty(point)){showCursorReadout(point.x,point.y,"");lastKey="";return}
-
-    const hours=getHours();
-    const qLon=quantize(lngLat.lng,QUANT_DEG);
-    const qLat=quantize(lngLat.lat,QUANT_DEG);
-
-    const key=`${ymd}|${hours}|${qLon.toFixed(6)}|${qLat.toFixed(6)}`;
-    if(key===lastKey)return;
-    lastKey=key;
-
-    const cached=cacheGet(key);
-    if(cached!=null){showCursorReadout(point.x,point.y,cached);return}
-
-    const now=Date.now();
-    pruneRecent(now);
-    const lastTs=recentReq.get(key);
-    if(lastTs&&(now-lastTs)<RECENT_REQ_MS){showCursorReadout(point.x,point.y,"Loading...");return}
-    recentReq.set(key,now);
-
-    showCursorReadout(point.x,point.y,"Loading...");
-
-    if(!batchSupported){
-      const myGen=selGen;
-      try{
-        const txt=await fetchSingleValue(ymd,hours,qLon,qLat);
-        if(myGen!==selGen)return;
-        cacheSet(key,txt);
-        if(key===lastKey)showCursorReadout(point.x,point.y,txt);
-      } catch {
-        if(key===lastKey)showCursorReadout(point.x,point.y,"");
-      }
-      return;
-    }
-
-    const existing=batchPoints.get(key);
-    if(existing){
-      existing.point=point;
-    } else {
-      batchPoints.set(key,{lon:qLon,lat:qLat,point});
-    }
-    scheduleBatchSend();
-  }
-
-  function maybeFire(){
-    rafPending=false;
-    if(!lastPoint)return;
-    if(!shouldReadout())return;
-    if(!tracksReady())return;
-
-    const now=Date.now();
-    if(now-lastFire<MIN_REQUEST_GAP_MS)return;
-
-    const{lngLat,point}=lastPoint;
-    if(lastPoint.prevPoint){
-      const dx=point.x-lastPoint.prevPoint.x,dy=point.y-lastPoint.prevPoint.y;
-      if((dx*dx+dy*dy)<(MIN_PIXEL_MOVE*MIN_PIXEL_MOVE))return;
-    }
-
-    lastFire=now;
-    fetchValueAt(lngLat,point);
-    lastPoint.prevPoint=point;
-  }
-
-  map.on("mousemove",(e)=>{
-    if(cursorEl.style.display!=="none"){cursorEl.style.left=e.point.x+"px";cursorEl.style.top=e.point.y+"px"}
-    if(!shouldReadout()){lastPoint=null;return}
-    if(!tracksReady()){lastPoint=null;lastKey="";if(cursorEl.style.display!=="none")showCursorReadout(0,0,"");return}
-    lastPoint={lngLat:e.lngLat,point:e.point,prevPoint:lastPoint?lastPoint.prevPoint:null};
-    if(!rafPending){rafPending=true;requestAnimationFrame(maybeFire)}
+    
+    if (!shouldReadout()) return;
+    if (!tracksReady()) return;
+    
+    updateCursorReadout(e.lngLat, e.point);
   });
 
-  map.on("mouseout",()=>{
-    lastKey="";
-    showCursorReadout(0,0,"");
-    batchPoints.clear();
-    if(batchTimer){clearTimeout(batchTimer);batchTimer=null}
+  map.on("mouseout", () => {
+    showCursorReadout(0, 0, "");
+    pendingCursorUpdate = null;
   });
 
-  map.on("zoomend",()=>{shouldReadout();prefetchDebounced()});
-  map.on("moveend",prefetchDebounced);
-  map.on("zoomend",()=>{
+  map.on("moveend", () => {
+    debouncedGridFetch();
+  });
+
+  map.on("zoomend", () => {
+    shouldReadout();
     if(map.getZoom()<CURSOR_ZMIN){lastKey="";showCursorReadout(0,0,"")}
+    debouncedGridFetch();
     prefetchDebounced();
+  });
+
+  map.on("error", (e) => {
+    const err = e.error;
+    if (err && err.message && err.message.includes("404")) {
+      console.warn("Tile not found:", err);
+      return;
+    }
+    showErr("Map error:\n" + (err ? err.message : String(e)));
   });
 
   map.on("load",async()=>{
@@ -775,17 +703,40 @@
       prefetchViewportTiles();
       setOpacity(parseFloat(OPACITY.value));
       shouldReadout();
+      onSelectionChange();
     } catch(e){
       showErr("Init error:\n"+String(e));
     }
   });
 
-  yearSel.addEventListener("change",()=>{recomputeMonthOptions();recomputeDayOptions();setTilesForSelection()});
-  monthSel.addEventListener("change",()=>{recomputeDayOptions();setTilesForSelection()});
-  daySel.addEventListener("change",()=>setTilesForSelection());
-  document.querySelectorAll('input[name="hours"]').forEach(el=>el.addEventListener("change",()=>setTilesForSelection()));
+  yearSel.addEventListener("change", () => {
+    recomputeMonthOptions();
+    recomputeDayOptions();
+    setTilesForSelection();
+    onSelectionChange();
+  });
+  
+  monthSel.addEventListener("change", () => {
+    recomputeDayOptions();
+    setTilesForSelection();
+    onSelectionChange();
+  });
+  
+  daySel.addEventListener("change", () => {
+    setTilesForSelection();
+    onSelectionChange();
+  });
+  
+  document.querySelectorAll('input[name="hours"]').forEach(el => 
+    el.addEventListener("change", () => {
+      setTilesForSelection();
+      onSelectionChange();
+    })
+  );
+
   OPACITY.addEventListener("input",()=>setOpacity(parseFloat(OPACITY.value)));
 })();
 </script>
+
 </body>
 </html>
