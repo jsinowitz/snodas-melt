@@ -1,5 +1,5 @@
 from __future__ import annotations
-import calendar, gzip, io, os, random, re, sys, tarfile, tempfile, threading, time, requests, json, rasterio, rioxarray
+import calendar, gzip, io, os, random, re, sys, tarfile, tempfile, threading, time, requests, json, rasterio, rioxarray, math
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -55,6 +55,13 @@ WARM_HOURS_LIST = [24, 72]
 CN_MBTILES_LOCAL = Path("cache") / "tracks" / "cn_tracks.mbtiles"
 CN_MBTILES_REPO_PATH = "tracks/cn_tracks.mbtiles"
 CN_BOUNDS_REPO_PATH = "tracks/cn_tracks.bounds.txt"
+_VIEWGRID_LOCK = threading.Lock()
+_VIEWGRID_CACHE: dict[tuple, tuple[float, Any]] = {}   # key -> (ts, response)
+_VIEWGRID_TTL_S = 45.0
+
+_MELTCOGS_LOCK = threading.Lock()
+_MELTCOGS_CACHE: dict[tuple, tuple[float, Any]] = {}   # key -> (ts, melt_cogs)
+_MELTCOGS_TTL_S = 300.0
 
 # How long to keep tile PNGs and forecast COGs (days of YYYYMMDD date keys)
 KEEP_TILE_DAYS = int(os.environ.get("KEEP_TILE_DAYS", "5"))     # keeps a little extra buffer
@@ -154,7 +161,9 @@ _BUILD_LOCKS_LOCK = threading.Lock()
 _LOG = deque(maxlen=2000)
 TILE_CACHE_DIR = (CACHE / "tile_png_cache" / "forecast_by_date")
 TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
+def _q(v: float, step: float) -> float:
+    return round(v / step) * step
+    
 
 @lru_cache(maxsize=8000)
 def _tile_png_cached(sig: str, z: int, x: int, y: int, max_in: float | None) -> bytes:
@@ -233,6 +242,13 @@ def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> b
 
 
 def _tile_cache_put(dom: str, hours: int, ymd: str, z: int, x: int, y: int, png: bytes) -> None:
+    # Optional: don't cache empty/transparent tiles
+    try:
+        if png == _transparent_png_256():
+            return
+    except Exception:
+        pass
+
     p = _tile_cache_path(dom, hours, ymd, z, x, y)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -3682,10 +3698,10 @@ def value_forecast_by_date(
         inches_1dp = None if inches is None else round(inches, 1)
         return {"ok": True, "hours": 72, "valid": valid, "run_init": run_init, "mm": None if mm is None else float(mm), "inches": inches, "inches_1dp": inches_1dp, "info": info}
 
+
 @app.post("/value/forecast/viewport_grid")
 def value_forecast_viewport_grid(payload: dict):
     """
-    Returns a grid of values for a viewport bounds.
     Payload: {date_yyyymmdd, hours, dom, bounds: [west, south, east, north], resolution: int}
     """
     with _Mode("value"):
@@ -3693,31 +3709,56 @@ def value_forecast_viewport_grid(payload: dict):
             date_yyyymmdd = payload.get("date_yyyymmdd")
             hours = int(payload.get("hours", 24))
             dom = (payload.get("dom") or "zz").lower()
-            bounds = payload.get("bounds")  # [west, south, east, north]
-            resolution = int(payload.get("resolution", 20))  # grid points per axis
-            
+            bounds = payload.get("bounds")
+            resolution = int(payload.get("resolution", 20))
+
             if not date_yyyymmdd or not bounds or len(bounds) != 4:
                 raise HTTPException(status_code=400, detail="Missing date_yyyymmdd or bounds")
-            
+
             west, south, east, north = [float(b) for b in bounds]
-            resolution = max(5, min(50, resolution))  # Clamp between 5 and 50
-            
+
+            # sane clamps
+            resolution = max(5, min(30, resolution))
+            south = max(-85.0, min(85.0, south))
+            north = max(-85.0, min(85.0, north))
+
+            # normalize bounds ordering
+            if east < west:
+                west, east = east, west
+            if north < south:
+                south, north = north, south
+
             valid = _norm_ts(f"{date_yyyymmdd}05")
-            
-            # Build COGs once
+
+            # quantize bounds so cache hits survive tiny pans
+            qstep = 0.10  # ~11km at equator; adjust if you want
+            qw, qs, qe, qn = _q(west, qstep), _q(south, qstep), _q(east, qstep), _q(north, qstep)
+
+            cache_key = ("v1", date_yyyymmdd, int(hours), dom, qw, qs, qe, qn, int(resolution))
+            with _VIEWGRID_LOCK:
+                hit = _tile_cache_get(_VIEWGRID_CACHE, cache_key, _VIEWGRID_TTL_S)
+            if hit is not None:
+                return hit
+
+            # build lon/lat arrays
+            lons = np.linspace(west, east, resolution)
+            lats = np.linspace(south, north, resolution)
+
             if int(hours) == 24:
                 sel = _pick_forecast_for_valid(valid, dom_prefer=dom)
                 if not sel.get("ok"):
                     detail = dict(sel)
                     detail["collab_last"] = dict(_COLLAB_LAST)
                     raise HTTPException(status_code=503, detail=detail)
-                
-                melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
-                
-                # Generate grid
-                lons = np.linspace(west, east, resolution)
-                lats = np.linspace(south, north, resolution)
-                
+
+                melt_key = ("24", dom, sel["run_init"], sel["valid"])
+                with _MELTCOGS_LOCK:
+                    melt_cogs = _tile_cache_get(_MELTCOGS_CACHE, melt_key, _MELTCOGS_TTL_S)
+                if melt_cogs is None:
+                    melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+                    with _MELTCOGS_LOCK:
+                        _tile_cache_put(_MELTCOGS_CACHE, melt_key, melt_cogs)
+
                 grid = []
                 for lat in lats:
                     row = []
@@ -3729,8 +3770,8 @@ def value_forecast_viewport_grid(payload: dict):
                             inches = float(mm) / INCH_TO_MM
                             row.append(round(inches, 1))
                     grid.append(row)
-                
-                return {
+
+                resp = {
                     "ok": True,
                     "hours": 24,
                     "valid": sel["valid"],
@@ -3739,19 +3780,20 @@ def value_forecast_viewport_grid(payload: dict):
                     "resolution": resolution,
                     "lons": lons.tolist(),
                     "lats": lats.tolist(),
-                    "grid": grid,  # [lat][lon] = inches or None
+                    "grid": grid,
                 }
-            
+
+                with _VIEWGRID_LOCK:
+                    _tile_cache_put(_VIEWGRID_CACHE, cache_key, resp)
+                return resp
+
             # 72h path
             run_init = _pick_best_run_init_for_valid_t0024(valid, dom_prefer=dom)
             if not run_init:
                 raise HTTPException(status_code=503, detail={"error": "no_run_init_for_valid"})
-            
+
             melt72_cog = _forecast_melt72h_end_cog(valid, dom_prefer=dom)
-            
-            lons = np.linspace(west, east, resolution)
-            lats = np.linspace(south, north, resolution)
-            
+
             grid = []
             for lat in lats:
                 row = []
@@ -3762,9 +3804,9 @@ def value_forecast_viewport_grid(payload: dict):
                     else:
                         inches = float(mm) / INCH_TO_MM
                         row.append(round(inches, 1))
-                row.append(row)
-            
-            return {
+                grid.append(row)  # FIXED
+
+            resp = {
                 "ok": True,
                 "hours": 72,
                 "valid": valid,
@@ -3775,13 +3817,17 @@ def value_forecast_viewport_grid(payload: dict):
                 "lats": lats.tolist(),
                 "grid": grid,
             }
-            
+
+            with _VIEWGRID_LOCK:
+                _tile_cache_put(_VIEWGRID_CACHE, cache_key, resp)
+            return resp
+
         except HTTPException:
             raise
         except Exception as e:
             _log("ERROR", f"[viewport_grid] error: {e!r}")
             raise HTTPException(status_code=500, detail=f"viewport_grid_error: {e!r}")
-
+            
 @app.get("/tiles/forecast/by_date/{z}/{x}/{y}.png")
 def tiles_forecast_by_date(
     z: int,
@@ -4242,10 +4288,77 @@ def __logs(since_ms: int | None = None, limit: int = 200):
             pass
     return {"count": len(rows[-limit:]), "items": rows[-limit:]}
     
-@app.get("/__debug/cn_tracks_maxzoom")
-def __debug_cn_tracks_maxzoom():
-    return {"maxzoom": _cn_mbtiles_maxzoom()}
 
+@app.get("/debug/forecast/72h_source")
+def debug_forecast_72h_source(
+    date_yyyymmdd: str = Query(..., regex=r"^\d{8}$"),
+    dom: str = Query("zz"),
+    try_pull: int = Query(0, ge=0, le=1),
+):
+    """
+    Debug: show the exact forecast 72h COG filename/path that SHOULD be used for a date,
+    whether it exists locally, and what HF-relative path would be pulled.
+
+    If try_pull=1, attempts an HF pull for the expected file (no build).
+    """
+    try:
+        # validate date quickly
+        datetime.strptime(date_yyyymmdd, "%Y%m%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail="date_yyyymmdd must be YYYYMMDD")
+
+    dom = (dom or "zz").lower()
+    valid = _norm_ts(f"{date_yyyymmdd}05")
+
+    # This computes the exact expected filename under CACHE/forecast/
+    expected_path = _forecast_dir() / f"fcst_melt72h_end_{valid}_{dom}_cog.tif"
+    rel = expected_path.relative_to(CACHE).as_posix()
+
+    before = {
+        "exists": expected_path.exists(),
+        "size": (expected_path.stat().st_size if expected_path.exists() else 0),
+    }
+
+    pulled = None
+    pull_err = None
+
+    if int(try_pull) == 1:
+        try:
+            pulled = bool(_hf_try_pull_file(rel))
+        except Exception as e:
+            pulled = False
+            pull_err = repr(e)
+
+    after = {
+        "exists": expected_path.exists(),
+        "size": (expected_path.stat().st_size if expected_path.exists() else 0),
+    }
+
+    # Helpful HF config visibility (doesn't expose token)
+    try:
+        _tok, _repo = _hf_cfg()
+    except Exception:
+        _repo = None
+
+    return {
+        "ok": True,
+        "date_yyyymmdd": date_yyyymmdd,
+        "valid": valid,
+        "dom": dom,
+
+        "expected_filename": expected_path.name,
+        "expected_local_path": str(expected_path),
+        "expected_hf_relative_path": rel,
+
+        "hf_pull_on_miss_enabled": bool(_hf_pull_on_miss_enabled()),
+        "hf_dataset_repo": _repo,
+
+        "local_before": before,
+        "try_pull": bool(int(try_pull)),
+        "hf_pull_returned": pulled,
+        "hf_pull_error": pull_err,
+        "local_after": after,
+    }
 if __name__ == "__main__":
     import uvicorn
 
