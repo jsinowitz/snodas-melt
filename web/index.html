@@ -161,7 +161,14 @@
   
   let gridAbort = null;
   let gridFetchInProgress = false;
+  const cfg = window.__SNODAS_CONFIG__ || {};
+  window.__SNODAS_CONFIG__ = cfg;
   
+  if (!cfg.VALUE_BASE) cfg.VALUE_BASE = window.location.origin;
+  if (cfg.USE_HF_TILES == null) cfg.USE_HF_TILES = true;
+  if (!cfg.HF_DATASET_REPO) cfg.HF_DATASET_REPO = "Jsinowitz/snodas-snowmelt-cache";
+  
+
   function fetchWithTimeout(url, opts, ms){
     const timeoutCtrl = new AbortController();
     const t = setTimeout(() => timeoutCtrl.abort("timeout"), ms);
@@ -418,6 +425,7 @@
         ? hfTileUrlTemplate(ymd, hours, DOM)
         : `/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${encodeURIComponent(ymd)}&hours=${encodeURIComponent(hours)}&dom=${encodeURIComponent(DOM)}`
     ];
+
 
     // Remove and re-add to force tile refresh
     if (map.getLayer(LAYER_ID)) {
