@@ -25,6 +25,7 @@ from huggingface_hub._commit_api import CommitOperationAdd, CommitOperationDelet
 from zoneinfo import ZoneInfo
 import sqlite3
 from rio_tiler.colormap import cmap
+from typing import Any
 # from PIL import Image
 # supposed to import mercantile? Says there isnt a module named mercantile, same with PIL above
 
@@ -90,6 +91,27 @@ def _is_valid_png_file(p: Path) -> bool:
     except Exception:
         return False
 
+def _mem_cache_get(cache: dict, key: Any, ttl_s: int) -> Any | None:
+    try:
+        v = cache.get(key)
+        if not v:
+            return None
+        ts, payload = v
+        if (time.time() - ts) > ttl_s:
+            try:
+                del cache[key]
+            except Exception:
+                pass
+            return None
+        return payload
+    except Exception:
+        return None
+
+def _mem_cache_put(cache: dict, key: Any, payload: Any) -> None:
+    try:
+        cache[key] = (time.time(), payload)
+    except Exception:
+        pass
 def _safe_unlink(p: Path) -> None:
     try:
         p.unlink(missing_ok=True)
@@ -3736,9 +3758,10 @@ def value_forecast_viewport_grid(payload: dict):
 
             cache_key = ("v1", date_yyyymmdd, int(hours), dom, qw, qs, qe, qn, int(resolution))
             with _VIEWGRID_LOCK:
-                hit = _tile_cache_get(_VIEWGRID_CACHE, cache_key, _VIEWGRID_TTL_S)
+                hit = _mem_cache_get(_VIEWGRID_CACHE, cache_key, _VIEWGRID_TTL_S)
             if hit is not None:
                 return hit
+
 
             # build lon/lat arrays
             lons = np.linspace(west, east, resolution)
@@ -3753,11 +3776,13 @@ def value_forecast_viewport_grid(payload: dict):
 
                 melt_key = ("24", dom, sel["run_init"], sel["valid"])
                 with _MELTCOGS_LOCK:
-                    melt_cogs = _tile_cache_get(_MELTCOGS_CACHE, melt_key, _MELTCOGS_TTL_S)
+                    melt_cogs = _mem_cache_get(_MELTCOGS_CACHE, melt_key, _MELTCOGS_TTL_S)
+
                 if melt_cogs is None:
                     melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
                     with _MELTCOGS_LOCK:
-                        _tile_cache_put(_MELTCOGS_CACHE, melt_key, melt_cogs)
+                        melt_cogs = _mem_cache_get(_MELTCOGS_CACHE, melt_key, _MELTCOGS_TTL_S)
+
 
                 grid = []
                 for lat in lats:
@@ -3784,7 +3809,7 @@ def value_forecast_viewport_grid(payload: dict):
                 }
 
                 with _VIEWGRID_LOCK:
-                    _tile_cache_put(_VIEWGRID_CACHE, cache_key, resp)
+                    _mem_cache_put(_VIEWGRID_CACHE, cache_key, resp)
                 return resp
 
             # 72h path
@@ -3819,7 +3844,8 @@ def value_forecast_viewport_grid(payload: dict):
             }
 
             with _VIEWGRID_LOCK:
-                _tile_cache_put(_VIEWGRID_CACHE, cache_key, resp)
+                _mem_cache_put(_VIEWGRID_CACHE, cache_key, resp)
+
             return resp
 
         except HTTPException:
