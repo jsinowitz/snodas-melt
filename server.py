@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 import sqlite3
 from rio_tiler.colormap import cmap
 from typing import Any
+import concurrent.futures
 # from PIL import Image
 # supposed to import mercantile? Says there isnt a module named mercantile, same with PIL above
 
@@ -38,7 +39,7 @@ HF_MAX_OPS_PER_COMMIT = int(os.environ.get("HF_MAX_OPS_PER_COMMIT", "300"))
 HF_PUSH_SLEEP_SEC = float(os.environ.get("HF_PUSH_SLEEP_SEC", "0.5"))
 
 ROLL_WINDOW_DAYS = int(os.environ.get("ROLL_WINDOW_DAYS", "5"))  # yesterday..+2
-SCHEDULE_HOUR_LOCAL = int(os.environ.get("SCHEDULE_HOUR_LOCAL", "7"))  # 7am local
+SCHEDULE_HOUR_LOCAL = int(os.environ.get("SCHEDULE_HOUR_LOCAL", "1"))  # 7am local
 SCHEDULE_MIN_LOCAL = int(os.environ.get("SCHEDULE_MIN_LOCAL", "0"))
 
 WARM_ZMIN = int(os.environ.get("WARM_ZMIN", "6"))
@@ -363,6 +364,19 @@ def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> b
 
     return None
 
+def _raw_tile_cache_put(dom: str, hours: int, ymd: str, z: int, x: int, y: int, raw: bytes) -> None:
+    """
+    Store raw tile data (NPZ format) to local cache.
+    This is the counterpart to _raw_tile_cache_get.
+    """
+    p = _raw_tile_cache_path(dom, hours, ymd, z, x, y)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_bytes(raw)
+        tmp.replace(p)
+    except Exception:
+        pass
 
 def _tile_cache_put(dom: str, hours: int, ymd: str, z: int, x: int, y: int, png: bytes) -> None:
     # Optional: don't cache empty/transparent tiles
@@ -454,6 +468,54 @@ def _cn_mbtiles_maxzoom() -> int:
         pass
 
     return 12
+def _tiles_for_boxes_zoom_range(
+    boxes: list[tuple[float, float, float, float]],
+    zmin: int,
+    zmax: int,
+) -> list[tuple[int, int, int]]:
+    """
+    Generate a list of tiles (z, x, y) for the given bounding boxes across zoom levels.
+    
+    Args:
+        boxes: List of (west, south, east, north) tuples
+        zmin: Minimum zoom level
+        zmax: Maximum zoom level
+    
+    Returns:
+        List of (z, x, y) tile coordinates
+    """
+    def lon2tile(lon: float, z: int) -> int:
+        return int(np.floor(((lon + 180.0) / 360.0) * (1 << int(z))))
+
+    def lat2tile(lat: float, z: int) -> int:
+        lat = max(min(float(lat), 85.05112878), -85.05112878)
+        r = np.deg2rad(lat)
+        n = np.log(np.tan(np.pi / 4.0 + r / 2.0))
+        return int(np.floor((1.0 - n / np.pi) / 2.0 * (1 << int(z))))
+
+    tiles: list[tuple[int, int, int]] = []
+    
+    for z in range(int(zmin), int(zmax) + 1):
+        n = (1 << int(z)) - 1
+        seen = set()
+
+        for (w, s, e, nlat) in boxes:
+            x0 = max(0, min(n, lon2tile(w, z)))
+            x1 = max(0, min(n, lon2tile(e, z)))
+            y0 = max(0, min(n, lat2tile(nlat, z)))  # north -> smaller y
+            y1 = max(0, min(n, lat2tile(s, z)))     # south -> larger y
+
+            xmin, xmax = (x0, x1) if x0 <= x1 else (x1, x0)
+            ymin, ymax = (y0, y1) if y0 <= y1 else (y1, y0)
+
+            for x in range(xmin, xmax + 1):
+                for y in range(ymin, ymax + 1):
+                    if (z, x, y) not in seen:
+                        seen.add((int(z), int(x), int(y)))
+
+        tiles.extend(sorted(seen))
+
+    return tiles
 
 def _generate_forecast_by_date_png(
     *,
@@ -3755,12 +3817,65 @@ def _ensure_forecast_cogs_for_date(date_yyyymmdd: str, dom: str) -> dict:
         "melt72_cog": melt72.name,
     }
 
+def _ensure_forecast_for_valid(valid: str, dom_prefer: str = "zz") -> dict:
+    """
+    Ensure all forecast COGs (24h and 72h) are built for a given valid timestamp.
+    This pre-builds both the 24h melt COGs and the combined 72h COG.
+    
+    Args:
+        valid: Valid timestamp in YYYYMMDDHH format
+        dom_prefer: Preferred domain (default "zz")
+    
+    Returns:
+        Dict with status and built COG information
+    """
+    dom_prefer = (dom_prefer or "zz").lower()
+    valid = _norm_ts(valid)
+    date_yyyymmdd = valid[:8]
+
+    # Build 24h COGs
+    sel = _pick_forecast_for_valid(valid, dom_prefer=dom_prefer)
+    if not sel.get("ok"):
+        return {"ok": False, "date": date_yyyymmdd, "valid": valid, "error": "pick_failed", "detail": sel}
+
+    try:
+        melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+    except Exception as e:
+        return {"ok": False, "date": date_yyyymmdd, "valid": valid, "error": f"melt_build_failed: {e!r}"}
+
+    snow_cogs = []
+    if sel.get("snowpack_urls"):
+        try:
+            snow_cogs = _build_forecast_snowpack_cogs(sel["valid"], sel["snowpack_urls"])
+        except Exception:
+            snow_cogs = []
+
+    # Build 72h COG (reuses the built 24h cogs for v0, v1, v2)
+    melt72 = None
+    melt72_name = None
+    try:
+        melt72 = _forecast_melt72h_end_cog(sel["valid"], dom_prefer=dom_prefer)
+        melt72_name = melt72.name if melt72 else None
+    except Exception as e:
+        _log("WARN", f"[ensure_forecast] 72h COG failed for {valid}: {e!r}")
+
+    return {
+        "ok": True,
+        "date": date_yyyymmdd,
+        "valid": sel["valid"],
+        "tt": sel["run_init"],
+        "dom": dom_prefer,
+        "melt24_cogs": [p.name for p in melt_cogs[:3]],
+        "snow_cogs": [p.name for p in snow_cogs[:3]],
+        "melt72_cog": melt72_name,
+    }
 def _next_run_local(now: datetime | None = None) -> datetime:
     now = now or datetime.now(LOCAL_TZ)
     target = now.replace(hour=SCHEDULE_HOUR_LOCAL, minute=SCHEDULE_MIN_LOCAL, second=0, microsecond=0)
     if target <= now:
         target = target + timedelta(days=1)
     return target
+
 
 def _run_daily_roll_job_once() -> dict:
     started = datetime.utcnow().isoformat()
@@ -3773,11 +3888,13 @@ def _run_daily_roll_job_once() -> dict:
 
     _log("INFO", f"[roll] start local_today={today_local.isoformat()} window={window}")
 
+    # Step 1: Pull existing cache from HF
     try:
         _hf_pull_cache()
-    except Exception:
-        pass
+    except Exception as e:
+        _log("WARN", f"[roll] hf_pull_cache failed: {e!r}")
 
+    # Step 2: Prune old tiles
     del_tiles = _prune_tile_cache(keep_set, KEEP_TILE_DAYS)
     del_raw_tiles = _prune_raw_tile_cache(keep_set, KEEP_TILE_DAYS)
     del_fcst = _prune_forecast_cogs(KEEP_FORECAST_COG_DAYS)
@@ -3787,6 +3904,7 @@ def _run_daily_roll_job_once() -> dict:
     except Exception:
         pass
 
+    # Step 3: Ensure forecast COGs are built FIRST (this is critical for 72h)
     ensured = []
     with _CpuLimits(tiles=4, value=None):
         with _HfPullOnMiss(True):
@@ -3796,95 +3914,147 @@ def _run_daily_roll_job_once() -> dict:
                 except Exception as e:
                     ensured.append({"ok": False, "date": ymd, "error": f"ensure_exc:{e!r}"})
 
+    # Step 4: Parallel tile baking for both PNG and raw tiles
     baked_corridor = []
     baked_corridor_raw = []
-    with _CpuLimits(tiles=None, value=None):
-        with _HfPullOnMiss(False):
-            for ymd in window:
-                try:
-                    baked_corridor.append(
-                        _bake_corridor_tiles_for_date(
-                            date_yyyymmdd=ymd,
-                            dom=WARM_DOM,
-                            hours_list=WARM_HOURS_LIST,
-                            zmin=WARM_ZMIN,
-                            zmax=WARM_ZMAX,
-                            miles=WARM_MILES,
-                            cap_per_zoom=WARM_CAP_PER_ZOOM,
-                            max_tiles_total=WARM_MAX_TILES_TOTAL,
-                            conc=max(1, min(6, int(os.environ.get("BAKE_CONCURRENCY", "10")))),
-                        )
-                    )
-                except Exception as e:
-                    baked_corridor.append({"ok": False, "date": ymd, "error": f"bake_exc:{e!r}"})
-
-                try:
-                    baked_corridor_raw.append(
-                        _bake_corridor_raw_tiles_for_date(
-                            date_yyyymmdd=ymd,
-                            dom=WARM_DOM,
-                            hours_list=WARM_HOURS_LIST,
-                            zmin=WARM_ZMIN,
-                            zmax=WARM_ZMAX,
-                            miles=WARM_MILES,
-                            cap_per_zoom=WARM_CAP_PER_ZOOM,
-                            max_tiles_total=WARM_MAX_TILES_TOTAL,
-                            conc=max(1, min(6, int(os.environ.get("BAKE_CONCURRENCY", "10")))),
-                        )
-                    )
-                except Exception as e:
-                    baked_corridor_raw.append({"ok": False, "date": ymd, "error": f"bake_raw_exc:{e!r}"})
-
     baked_lowres = []
     baked_lowres_raw = []
+
+    def bake_all_for_date(ymd: str) -> dict:
+        """Bake all tile types for a single date."""
+        results = {
+            "date": ymd,
+            "corridor": None,
+            "corridor_raw": None,
+            "lowres": None,
+            "lowres_raw": None,
+        }
+        
+        conc = max(1, min(6, int(os.environ.get("BAKE_CONCURRENCY", "10"))))
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {}
+            
+            # Submit all four baking tasks in parallel
+            futures["corridor"] = executor.submit(
+                _bake_corridor_tiles_for_date,
+                date_yyyymmdd=ymd,
+                dom=WARM_DOM,
+                hours_list=WARM_HOURS_LIST,
+                zmin=WARM_ZMIN,
+                zmax=WARM_ZMAX,
+                miles=WARM_MILES,
+                cap_per_zoom=WARM_CAP_PER_ZOOM,
+                max_tiles_total=WARM_MAX_TILES_TOTAL,
+                conc=conc,
+            )
+            
+            futures["corridor_raw"] = executor.submit(
+                _bake_corridor_raw_tiles_for_date,
+                date_yyyymmdd=ymd,
+                dom=WARM_DOM,
+                hours_list=WARM_HOURS_LIST,
+                zmin=WARM_ZMIN,
+                zmax=WARM_ZMAX,
+                miles=WARM_MILES,
+                cap_per_zoom=WARM_CAP_PER_ZOOM,
+                max_tiles_total=WARM_MAX_TILES_TOTAL,
+                conc=conc,
+            )
+            
+            futures["lowres"] = executor.submit(
+                _bake_lowres_box_tiles_for_date,
+                date_yyyymmdd=ymd,
+                dom=WARM_DOM,
+                hours_list=WARM_HOURS_LIST,
+                zmin=LOWRES_BOX_ZMIN,
+                zmax=LOWRES_BOX_ZMAX,
+                conc=conc,
+            )
+            
+            futures["lowres_raw"] = executor.submit(
+                _bake_lowres_box_raw_tiles_for_date,
+                date_yyyymmdd=ymd,
+                dom=WARM_DOM,
+                hours_list=WARM_HOURS_LIST,
+                zmin=LOWRES_BOX_ZMIN,
+                zmax=LOWRES_BOX_ZMAX,
+                conc=conc,
+            )
+            
+            # Collect results
+            for key, future in futures.items():
+                try:
+                    results[key] = future.result(timeout=600)
+                except Exception as e:
+                    results[key] = {"ok": False, "error": f"{key}_exc:{e!r}"}
+        
+        return results
+
+    # Process all dates with parallel execution
+    _log("INFO", f"[roll] starting parallel tile baking for {len(window)} dates")
+    
     with _CpuLimits(tiles=None, value=None):
         with _HfPullOnMiss(False):
-            for ymd in window:
-                try:
-                    baked_lowres.append(
-                        _bake_lowres_box_tiles_for_date(
-                            date_yyyymmdd=ymd,
-                            dom=WARM_DOM,
-                            hours_list=WARM_HOURS_LIST,
-                            zmin=LOWRES_BOX_ZMIN,
-                            zmax=LOWRES_BOX_ZMAX,
-                            conc=max(1, min(6, int(os.environ.get("BAKE_CONCURRENCY", "10")))),
-                        )
-                    )
-                except Exception as e:
-                    baked_lowres.append({"ok": False, "date": ymd, "error": f"bake_lowres_exc:{e!r}"})
+            max_parallel_dates = min(2, len(window))
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel_dates) as executor:
+                future_to_date = {executor.submit(bake_all_for_date, ymd): ymd for ymd in window}
+                
+                for future in concurrent.futures.as_completed(future_to_date):
+                    ymd = future_to_date[future]
+                    try:
+                        results = future.result(timeout=1200)
+                        baked_corridor.append(results.get("corridor", {"ok": False, "date": ymd}))
+                        baked_corridor_raw.append(results.get("corridor_raw", {"ok": False, "date": ymd}))
+                        baked_lowres.append(results.get("lowres", {"ok": False, "date": ymd}))
+                        baked_lowres_raw.append(results.get("lowres_raw", {"ok": False, "date": ymd}))
+                        _log("INFO", f"[roll] completed baking for {ymd}")
+                    except Exception as e:
+                        _log("WARN", f"[roll] bake_all_for_date failed for {ymd}: {e!r}")
+                        baked_corridor.append({"ok": False, "date": ymd, "error": f"exc:{e!r}"})
+                        baked_corridor_raw.append({"ok": False, "date": ymd, "error": f"exc:{e!r}"})
+                        baked_lowres.append({"ok": False, "date": ymd, "error": f"exc:{e!r}"})
+                        baked_lowres_raw.append({"ok": False, "date": ymd, "error": f"exc:{e!r}"})
 
-                try:
-                    baked_lowres_raw.append(
-                        _bake_lowres_box_raw_tiles_for_date(
-                            date_yyyymmdd=ymd,
-                            dom=WARM_DOM,
-                            hours_list=WARM_HOURS_LIST,
-                            zmin=LOWRES_BOX_ZMIN,
-                            zmax=LOWRES_BOX_ZMAX,
-                            conc=max(1, min(6, int(os.environ.get("BAKE_CONCURRENCY", "10")))),
-                        )
-                    )
-                except Exception as e:
-                    baked_lowres_raw.append({"ok": False, "date": ymd, "error": f"bake_lowres_raw_exc:{e!r}"})
+    _log("INFO", "[roll] tile baking complete, starting HF push")
 
+    # Step 5: Push tiles to HF in parallel
     pushed_tiles = None
     pushed_raw_tiles = None
 
-    try:
-        pushed_tiles = _hf_push_tilecache_for_window(window, WARM_DOM, WARM_HOURS_LIST, zmin=WARM_ZMIN, zmax=WARM_ZMAX)
-    except Exception as e:
-        pushed_tiles = {"ok": False, "error": f"push_tilecache_exc:{e!r}"}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        tile_future = executor.submit(
+            _hf_push_tilecache_for_window, 
+            window, WARM_DOM, WARM_HOURS_LIST, 
+            LOWRES_BOX_ZMIN, WARM_ZMAX  # Push all zoom levels
+        )
+        raw_future = executor.submit(
+            _hf_push_rawtilecache_for_window,
+            window, WARM_DOM, WARM_HOURS_LIST,
+            LOWRES_BOX_ZMIN, WARM_ZMAX
+        )
+        
+        try:
+            pushed_tiles = tile_future.result(timeout=600)
+        except Exception as e:
+            pushed_tiles = {"ok": False, "error": f"push_exc:{e!r}"}
+            
+        try:
+            pushed_raw_tiles = raw_future.result(timeout=600)
+        except Exception as e:
+            pushed_raw_tiles = {"ok": False, "error": f"push_exc:{e!r}"}
 
-    try:
-        pushed_raw_tiles = _hf_push_rawtilecache_for_window(window, WARM_DOM, WARM_HOURS_LIST, zmin=WARM_ZMIN, zmax=WARM_ZMAX)
-    except Exception as e:
-        pushed_raw_tiles = {"ok": False, "error": f"push_rawtilecache_exc:{e!r}"}
-
+    # Step 6: Prune and flush
     try:
         _hf_prune_remote_and_local(keep_days=max(KEEP_FORECAST_COG_DAYS, KEEP_TILE_DAYS))
-    except Exception:
-        pass
+    except Exception as e:
+        _log("WARN", f"[roll] hf_prune failed: {e!r}")
+
+    try:
+        _hf_flush_pending(f"roll_flush_{today_local.isoformat()}")
+    except Exception as e:
+        _log("WARN", f"[roll] hf_flush_pending failed: {e!r}")
 
     finished = datetime.utcnow().isoformat()
     _log("INFO", f"[roll] done finished_utc={finished}")
