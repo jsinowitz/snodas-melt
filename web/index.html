@@ -1,16 +1,73 @@
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="description" content="CN Railroad Snowmelt Map - NOAA/SNODAS snowmelt data visualization">
   <title>CN Snowmelt</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
 
+  <!-- Preconnect to critical origins (saves ~150-230ms) -->
+  <link rel="preconnect" href="https://api.mapbox.com" crossorigin>
+  <link rel="preconnect" href="https://events.mapbox.com" crossorigin>
+  <link rel="dns-prefetch" href="https://api.mapbox.com">
+  
+  <!-- Load Mapbox CSS first (smaller, needed for layout) -->
   <link href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet" />
-  <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
-  <script src="https://unpkg.com/fflate@0.8.2/umd/index.js"></script>
+  
+  <!-- Defer Mapbox JS - load async to not block render -->
+  <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js" defer></script>
+  <script src="https://unpkg.com/fflate@0.8.2/umd/index.js" defer></script>
 
   <style>
     html, body { height: 100%; margin: 0; }
     #map { position: absolute; inset: 0; }
+
+    /* Loading screen shown immediately */
+    .initial-loading {
+      position: absolute;
+      inset: 0;
+      z-index: 200;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      color: #fff;
+      transition: opacity 0.3s ease-out;
+    }
+    .initial-loading.fade-out {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .initial-loading h1 {
+      font-size: 24px;
+      margin: 0 0 8px 0;
+      font-weight: 600;
+    }
+    .initial-loading p {
+      font-size: 14px;
+      margin: 0 0 24px 0;
+      opacity: 0.8;
+    }
+    .progress-bar {
+      width: 200px;
+      height: 4px;
+      background: rgba(255,255,255,0.2);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: #4dabf7;
+      width: 0%;
+      transition: width 0.3s ease-out;
+    }
+    .loading-status {
+      font-size: 12px;
+      margin-top: 12px;
+      opacity: 0.6;
+    }
 
     .panel-stack{
       position:absolute;
@@ -94,42 +151,35 @@
       display: none;
       white-space: nowrap;
     }
-    /* Loading indicator */
-    .loading-overlay {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      z-index: 100;
-      background: rgba(255,255,255,0.95);
-      border-radius: 12px;
-      padding: 20px 30px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.2);
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-      text-align: center;
-      display: none;
-    }
-    .loading-overlay.visible { display: block; }
-    .loading-spinner {
-      width: 32px;
-      height: 32px;
-      border: 3px solid #e0e0e0;
-      border-top-color: #0b57d0;
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-      margin: 0 auto 10px auto;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-  </style>
 
+    /* Accessibility improvements */
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+  </style>
 </head>
 <body>
+  <!-- Immediate loading screen (no JS required) -->
+  <div id="initialLoading" class="initial-loading">
+    <h1>CN Snowmelt Map</h1>
+    <p>Loading NOAA/SNODAS data...</p>
+    <div class="progress-bar">
+      <div id="progressFill" class="progress-bar-fill"></div>
+    </div>
+    <div id="loadingStatus" class="loading-status">Initializing...</div>
+  </div>
+
   <div id="map"></div>
   <div id="cursorReadout" class="cursor-readout"></div>
-  <div id="loadingOverlay" class="loading-overlay">
-      <div class="loading-spinner"></div>
-      <div>Loading snowmelt data...</div>
-    </div>
+  
   <div class="panel-stack">
     <div class="panel-link">
       <a href="https://accuweather.atlassian.net/wiki/spaces/AO/pages/3596288537/Snowmelt" id="confluenceLink" target="_blank" rel="noopener">Snowmelt Confluence</a>
@@ -140,9 +190,12 @@
       <div class="sub" id="subtitle">Loading…</div>
 
       <div class="pickrow">
-        <select id="yearSel"></select>
-        <select id="monthSel"></select>
-        <select id="daySel"></select>
+        <label class="sr-only" for="yearSel">Year</label>
+        <select id="yearSel" aria-label="Year"></select>
+        <label class="sr-only" for="monthSel">Month</label>
+        <select id="monthSel" aria-label="Month"></select>
+        <label class="sr-only" for="daySel">Day</label>
+        <select id="daySel" aria-label="Day"></select>
       </div>
 
       <div class="row">
@@ -155,56 +208,104 @@
       </div>
 
       <div class="sliderrow">
-        <div style="font-size:13px;">Opacity</div>
-        <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.80" />
-        <div id="opv" style="font-size:12px;color:#333;width:40px;text-align:right;"></div>
+        <label for="opacity" style="font-size:13px;">Opacity</label>
+        <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.80" aria-label="Snowmelt layer opacity" />
+        <div id="opv" style="font-size:12px;color:#333;width:40px;text-align:right;" aria-live="polite"></div>
       </div>
 
       <div class="legend">
         <div class="legend-title" id="legendTitle">Inches of water equivalent</div>
-        <div class="legend-grid" id="legendGrid"></div>
+        <div class="legend-grid" id="legendGrid" role="list"></div>
       </div>
 
-      <div class="err" id="err"></div>
+      <div class="err" id="err" role="alert"></div>
     </div>
   </div>
+
 <script src="/config.js"></script>
 <script>
-(function () {
-  const errBox=document.getElementById("err"),subtitle=document.getElementById("subtitle"),yearSel=document.getElementById("yearSel"),monthSel=document.getElementById("monthSel"),daySel=document.getElementById("daySel"),legendGrid=document.getElementById("legendGrid"),OPACITY=document.getElementById("opacity"),OPV=document.getElementById("opv"),cursorEl=document.getElementById("cursorReadout");
+// Wait for deferred scripts to load
+function waitForMapbox(callback) {
+  if (typeof mapboxgl !== 'undefined') {
+    callback();
+  } else {
+    setTimeout(() => waitForMapbox(callback), 50);
+  }
+}
 
-  const DOM="zz";
-  const TRACE_INCHES=0.02;
-  const ALPHA_GATE=false;
-
-  const MIN_ZOOM_FOR_READOUT=9;
-  const CURSOR_ZMIN=9;
-  const PREFETCH_ZMIN=9;
-
-  const INITIAL_BOUNDS=[[-130.359201,29.915607],[-63.228204,60.840431]];
-
-  let readoutsEnabled=false,lastKey="";
-  const GRID_RESOLUTION = 12;
-  const GRID_EXPAND_FRAC = 0.35;
-  const GRID_TIMEOUT_MS = 6000;
-  const POINT_TIMEOUT_MS = 2500;
+waitForMapbox(function() {
+  'use strict';
   
-  let gridAbort = null;
-  let gridFetchInProgress = false;
+  // === Progress tracking ===
+  const progressEl = document.getElementById('progressFill');
+  const statusEl = document.getElementById('loadingStatus');
+  const initialLoadingEl = document.getElementById('initialLoading');
+  
+  let loadProgress = 0;
+  function setProgress(percent, status) {
+    loadProgress = Math.max(loadProgress, percent);
+    if (progressEl) progressEl.style.width = loadProgress + '%';
+    if (statusEl && status) statusEl.textContent = status;
+  }
+  
+  function hideInitialLoading() {
+    if (initialLoadingEl) {
+      initialLoadingEl.classList.add('fade-out');
+      setTimeout(() => {
+        initialLoadingEl.style.display = 'none';
+      }, 300);
+    }
+  }
+  
+  setProgress(10, 'Loading map...');
+
+  const errBox = document.getElementById("err");
+  const subtitle = document.getElementById("subtitle");
+  const yearSel = document.getElementById("yearSel");
+  const monthSel = document.getElementById("monthSel");
+  const daySel = document.getElementById("daySel");
+  const legendGrid = document.getElementById("legendGrid");
+  const OPACITY = document.getElementById("opacity");
+  const OPV = document.getElementById("opv");
+  const cursorEl = document.getElementById("cursorReadout");
+  const DOM = "zz";
+  const TRACE_INCHES = 0.02;
+  const MIN_ZOOM_FOR_READOUT = 9;
+  const CURSOR_ZMIN = 9;
+  const PREFETCH_ZMIN = 9;
+  let selGen = 0;
+  let lastRasterSrcId = null;
+  let lastRasterLayerId = null;
+  let rawPrefetchTimer = null;
+  const INITIAL_BOUNDS = [[-130.359201, 29.915607], [-63.228204, 60.840431]];
+  let readoutsEnabled = false, lastKey = "";
+  const GRID_RESOLUTION = 12;
+
   const cfg = window.__SNODAS_CONFIG__ || {};
   window.__SNODAS_CONFIG__ = cfg;
   
   if (!cfg.VALUE_BASE) cfg.VALUE_BASE = window.location.origin;
   if (cfg.USE_HF_TILES == null) cfg.USE_HF_TILES = false;
   if (!cfg.HF_DATASET_REPO) cfg.HF_DATASET_REPO = "Jsinowitz/snodas-snowmelt-cache";
+    const CLIENT_ID = (() => {
+    try {
+      const k = "snodas_client_id";
+      const v = localStorage.getItem(k);
+      if (v) return v;
+      const id = (crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(16) + Math.random().toString(16).slice(2));
+      localStorage.setItem(k, id);
+      return id;
+    } catch {
+      return (Date.now().toString(16) + Math.random().toString(16).slice(2));
+    }
+  })();
+  
   
 
-  function fetchWithTimeout(url, opts, ms){
+  function fetchWithTimeout(url, opts, ms) {
     const timeoutCtrl = new AbortController();
     const t = setTimeout(() => timeoutCtrl.abort("timeout"), ms);
-  
     const userSignal = opts && opts.signal ? opts.signal : null;
-  
     let signal = timeoutCtrl.signal;
     if (userSignal) {
       const combo = new AbortController();
@@ -213,72 +314,55 @@
       timeoutCtrl.signal.addEventListener("abort", onAbort, { once: true });
       signal = combo.signal;
     }
-  
     const merged = Object.assign({}, opts || {}, { signal });
     return fetch(url, merged).finally(() => clearTimeout(t));
   }
 
-  function clampLat(lat){ return Math.max(-85, Math.min(85, lat)); }
+  function showErr(msg) { errBox.style.display = "block"; errBox.textContent = msg; }
+  function z2(n) { return (n < 10 ? "0" : "") + n; }
 
-  function showErr(msg){errBox.style.display="block";errBox.textContent=msg}
-  function showLoading(show){
-    const el=document.getElementById("loadingOverlay");
-    if(el) el.classList.toggle("visible",show);
-  }
-  function z2(n){return(n<10?"0":"")+n}
+  const token = (window.__SNODAS_CONFIG__ && window.__SNODAS_CONFIG__.MAPBOX_TOKEN) || "";
+  if (!token) { showErr("Missing MAPBOX_TOKEN. Check /config.js and server environment."); return; }
+  mapboxgl.accessToken = token;
 
-  const token=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.MAPBOX_TOKEN)||"";
-  if(!token){showErr("Missing MAPBOX_TOKEN. Check /config.js and server environment.");return}
-  mapboxgl.accessToken=token;
+  setProgress(20, 'Creating map...');
 
-  const map=new mapboxgl.Map({
-    container:"map",
-    style:"mapbox://styles/mapbox/satellite-streets-v12",
+  const map = new mapboxgl.Map({
+    container: "map",
+    style: "mapbox://styles/mapbox/satellite-streets-v12",
     bounds: INITIAL_BOUNDS,
-    fitBoundsOptions:{padding:40,duration:0,maxZoom:7}
+    fitBoundsOptions: { padding: 40, duration: 0, maxZoom: 7 },
+    // Performance optimizations
+    fadeDuration: 0,           // Disable fade animations
+    trackResize: true,
+    preserveDrawingBuffer: false,
+    antialias: false,          // Disable antialiasing for better performance
+    refreshExpiredTiles: false // Don't auto-refresh expired tiles
   });
 
-  if(typeof map.isPitching!=="function")map.isPitching=()=>false;
-  if(typeof map.isRotating!=="function")map.isRotating=()=>false;
+  if (typeof map.isPitching !== "function") map.isPitching = () => false;
+  if (typeof map.isRotating !== "function") map.isRotating = () => false;
 
-  // const VALUE_BASE=(window.__SNODAS_CONFIG__&&window.__SNODAS_CONFIG__.VALUE_BASE)||window.location.origin;
-  // // ===== HF TILE CONFIG (prevents ReferenceError + allows direct dataset reads) =====
-  // const USE_HF_TILES = !!((window.__SNODAS_CONFIG__ && window.__SNODAS_CONFIG__.USE_HF_TILES) || false);
-
-  // const HF_TILE_BASE =
-  //   (window.__SNODAS_CONFIG__ && window.__SNODAS_CONFIG__.HF_TILE_BASE) ||
-  //   (window.__SNODAS_CONFIG__ && window.__SNODAS_CONFIG__.HF_DATASET_REPO
-  //     ? ("https://huggingface.co/datasets/" + window.__SNODAS_CONFIG__.HF_DATASET_REPO + "/resolve/main")
-  //     : "");
-  // console.log("USE_HF_TILES", USE_HF_TILES, "HF_TILE_BASE", HF_TILE_BASE);
-
-  // function hfTileUrlTemplate(ymd, hours, dom){
-  //   dom = (dom || "zz").toLowerCase();
-  //   return HF_TILE_BASE + `/tilecache/bydate_${dom}_h${hours}_${ymd}_z{z}_{x}_{y}.png`;
-  // }
-  // function hfRawTileUrlTemplate(ymd, hours, dom){
-  //   dom = (dom || "zz").toLowerCase();
-  //   return HF_TILE_BASE + `/rawtilecache/bydate_${dom}_h${hours}_${ymd}_z{z}_{x}_{y}.npz`;
-  // }
   const VALUE_BASE = (window.__SNODAS_CONFIG__ && window.__SNODAS_CONFIG__.VALUE_BASE) || window.location.origin;
 
-  function rawTileUrl(z,x,y,ymd,hours){
-    return `/tiles/forecast/by_date_raw/${z}/${x}/${y}.npz?date_yyyymmdd=${encodeURIComponent(ymd)}&hours=${encodeURIComponent(hours)}&dom=${encodeURIComponent(DOM)}`;
+  function rawTileUrl(z, x, y, ymd, hours) {
+    return `/tiles/forecast_raw/by_date/${z}/${x}/${y}.npz?date_yyyymmdd=${encodeURIComponent(ymd)}&hours=${encodeURIComponent(hours)}&dom=${encodeURIComponent(DOM)}&client_id=${encodeURIComponent(CLIENT_ID)}&gen=${encodeURIComponent(String(selGen))}`;
+  }
+  
+  function tileUrl(z, x, y, ymd, hours) {
+    return `/tiles/forecast/by_date/${z}/${x}/${y}.png?date_yyyymmdd=${encodeURIComponent(ymd)}&hours=${encodeURIComponent(hours)}&dom=${encodeURIComponent(DOM)}&client_id=${encodeURIComponent(CLIENT_ID)}&gen=${encodeURIComponent(String(selGen))}`;
   }
 
-  function tileUrl(z,x,y,ymd,hours){
-    return `/tiles/forecast/by_date/${z}/${x}/${y}.png?date_yyyymmdd=${encodeURIComponent(ymd)}&hours=${encodeURIComponent(hours)}&dom=${encodeURIComponent(DOM)}`;
-  }
 
-  const CN_LINE_GLOW="cn_tracks_src_line_glow",CN_LINE="cn_tracks_src_line";
-  const LAYER_ID="melt_layer",SRC_ID="melt_src";
+  const CN_LINE_GLOW = "cn_tracks_src_line_glow", CN_LINE = "cn_tracks_src_line";
+  const LAYER_ID = "melt_layer", SRC_ID = "melt_src";
 
-  function tracksReady(){return !!(map.getLayer(CN_LINE)||map.getLayer(CN_LINE_GLOW))}
+  function tracksReady() { return !!(map.getLayer(CN_LINE) || map.getLayer(CN_LINE_GLOW)); }
 
   const TRACK_CORRIDOR_MILES = 8;
   const TRACK_CORRIDOR_PX_CAP = 90;
   
-  function milesToPixels(miles, latDeg, zoom){
+  function milesToPixels(miles, latDeg, zoom) {
     const meters = miles * 1609.344;
     const lat = latDeg * Math.PI / 180;
     const metersPerPixel = 156543.03392 * Math.cos(lat) / Math.pow(2, zoom);
@@ -286,495 +370,599 @@
     return meters / metersPerPixel;
   }
   
-  function nearTrack(point, lngLat){
+  function nearTrack(point, lngLat) {
     const layers = [];
     if (map.getLayer(CN_LINE)) layers.push(CN_LINE);
     if (map.getLayer(CN_LINE_GLOW)) layers.push(CN_LINE_GLOW);
     if (!layers.length) return false;
-  
     const z = map.getZoom();
     const rRaw = milesToPixels(TRACK_CORRIDOR_MILES, lngLat.lat, z);
     const r = Math.max(6, Math.min(TRACK_CORRIDOR_PX_CAP, Math.round(rRaw)));
-  
-    const bbox = [
-      [point.x - r, point.y - r],
-      [point.x + r, point.y + r]
-    ];
-  
+    const bbox = [[point.x - r, point.y - r], [point.x + r, point.y + r]];
     const feats = map.queryRenderedFeatures(bbox, { layers });
     return !!(feats && feats.length);
   }
-
-  function muteRoads(map){
-    const style=map.getStyle(); if(!style||!style.layers)return;
-    const roadLike=l=>{const id=(l.id||"").toLowerCase(),sl=(l["source-layer"]||"").toLowerCase();return id.includes("road")||id.includes("street")||id.includes("highway")||id.includes("bridge")||id.includes("tunnel")||id.includes("motorway")||sl.includes("road")||sl.includes("street")||sl.includes("transportation")};
-    for(const l of style.layers){
-      if(!roadLike(l))continue;
-      if(l.type==="line"){
-        if(map.getPaintProperty(l.id,"line-color")!=null)map.setPaintProperty(l.id,"line-color","#c7c7c7");
-        if(map.getPaintProperty(l.id,"line-opacity")!=null)map.setPaintProperty(l.id,"line-opacity",0.40);
-        if(map.getPaintProperty(l.id,"line-width")!=null){const w=map.getPaintProperty(l.id,"line-width");if(typeof w==="number")map.setPaintProperty(l.id,"line-width",Math.max(0.5,w*0.8))}
+  function hideCountryLabels(map) {
+    const style = map.getStyle();
+    if (!style || !style.layers) return;
+    
+    for (const layer of style.layers) {
+      const id = (layer.id || "").toLowerCase();
+      // Match country and continent labels
+      if (id.includes("country-label") || 
+        id.includes("continent-label") || 
+        id.includes("state-label")) {
+      map.setLayoutProperty(layer.id, "visibility", "none");
       }
-      if(l.type==="fill"){
-        if(map.getPaintProperty(l.id,"fill-color")!=null)map.setPaintProperty(l.id,"fill-color","#d0d0d0");
-        if(map.getPaintProperty(l.id,"fill-opacity")!=null)map.setPaintProperty(l.id,"fill-opacity",0.20);
+    }
+  }
+  
+  function muteRoads(map) {
+    const style = map.getStyle(); if (!style || !style.layers) return;
+    const roadLike = l => {
+      const id = (l.id || "").toLowerCase(), sl = (l["source-layer"] || "").toLowerCase();
+      return id.includes("road") || id.includes("street") || id.includes("highway") || 
+             id.includes("bridge") || id.includes("tunnel") || id.includes("motorway") || 
+             sl.includes("road") || sl.includes("street") || sl.includes("transportation");
+    };
+    for (const l of style.layers) {
+      if (!roadLike(l)) continue;
+      if (l.type === "line") {
+        if (map.getPaintProperty(l.id, "line-color") != null) map.setPaintProperty(l.id, "line-color", "#c7c7c7");
+        if (map.getPaintProperty(l.id, "line-opacity") != null) map.setPaintProperty(l.id, "line-opacity", 0.40);
+        if (map.getPaintProperty(l.id, "line-width") != null) {
+          const w = map.getPaintProperty(l.id, "line-width");
+          if (typeof w === "number") map.setPaintProperty(l.id, "line-width", Math.max(0.5, w * 0.8));
+        }
+      }
+      if (l.type === "fill") {
+        if (map.getPaintProperty(l.id, "fill-color") != null) map.setPaintProperty(l.id, "fill-color", "#d0d0d0");
+        if (map.getPaintProperty(l.id, "fill-opacity") != null) map.setPaintProperty(l.id, "fill-opacity", 0.20);
       }
     }
   }
 
-  function lon2tile(lon,z){return Math.floor(((lon+180)/360)*(1<<z))}
-  function lat2tile(lat,z){const r=lat*Math.PI/180,n=Math.log(Math.tan(Math.PI/4+r/2));return Math.floor((1-n/Math.PI)/2*(1<<z))}
-  function clamp(n,a,b){return Math.max(a,Math.min(b,n))}
-  function tileRangeForBounds(b,z){
-    const w=b.getWest(),s=b.getSouth(),e=b.getEast(),n=b.getNorth(),max=(1<<z)-1;
-    let x0=lon2tile(w,z),x1=lon2tile(e,z),y0=lat2tile(n,z),y1=lat2tile(s,z);
-    x0=clamp(x0,0,max);x1=clamp(x1,0,max);y0=clamp(y0,0,max);y1=clamp(y1,0,max);
-    const xmin=Math.min(x0,x1),xmax=Math.max(x0,x1),ymin=Math.min(y0,y1),ymax=Math.max(y0,y1);
-    return{xmin,xmax,ymin,ymax}
+  function lon2tile(lon, z) { return Math.floor(((lon + 180) / 360) * (1 << z)); }
+  function lat2tile(lat, z) { const r = lat * Math.PI / 180, n = Math.log(Math.tan(Math.PI / 4 + r / 2)); return Math.floor((1 - n / Math.PI) / 2 * (1 << z)); }
+  function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+  
+  function tileRangeForBounds(b, z) {
+    const w = b.getWest(), s = b.getSouth(), e = b.getEast(), n = b.getNorth(), max = (1 << z) - 1;
+    let x0 = lon2tile(w, z), x1 = lon2tile(e, z), y0 = lat2tile(n, z), y1 = lat2tile(s, z);
+    x0 = clamp(x0, 0, max); x1 = clamp(x1, 0, max); y0 = clamp(y0, 0, max); y1 = clamp(y1, 0, max);
+    const xmin = Math.min(x0, x1), xmax = Math.max(x0, x1), ymin = Math.min(y0, y1), ymax = Math.max(y0, y1);
+    return { xmin, xmax, ymin, ymax };
   }
 
-  function makeQueue(limit){
-    let active=0;const q=[];
-    const run=()=>{while(active<limit&&q.length){const fn=q.shift();active++;Promise.resolve().then(fn).catch(()=>{}).finally(()=>{active--;run()})}};
-    const push=fn=>{q.push(fn);run()};
-    push.clear=()=>{q.length=0};
-    return push
+  function makeQueue(limit) {
+    let active = 0; const q = [];
+    const run = () => {
+      while (active < limit && q.length) {
+        const fn = q.shift(); active++;
+        Promise.resolve().then(fn).catch(() => {}).finally(() => { active--; run(); });
+      }
+    };
+    const push = fn => { q.push(fn); run(); };
+    push.clear = () => { q.length = 0; };
+    return push;
   }
 
-  const prefetchPush=makeQueue(10);
-  const prefetched=new Set();
+  const prefetchPush = makeQueue(10);
+  const prefetched = new Set();
 
-  function prefetchViewportTiles(){
-    if(map.getZoom()<PREFETCH_ZMIN)return;
-    const ymd=selectedDateYMD();
-    if(!ymd)return;
-    const hours=getHours();
-    const z0=Math.max(0,Math.floor(map.getZoom()));
-    const maxZ=Math.min(12,z0+3);
-    const b=map.getBounds();
-    for(let z=z0+1;z<=maxZ;z++){
-      const r=tileRangeForBounds(b,z);
-      for(let x=r.xmin;x<=r.xmax;x++)for(let y=r.ymin;y<=r.ymax;y++){
-        const u=tileUrl(z,x,y,ymd,hours);
-        if(prefetched.has(u))continue;
+  function prefetchViewportTiles() {
+    if (map.getZoom() < PREFETCH_ZMIN) return;
+    const ymd = selectedDateYMD();
+    if (!ymd) return;
+    const hours = getHours();
+    const z0 = Math.max(0, Math.floor(map.getZoom()));
+    const maxZ = Math.min(12, z0 + 3);
+    const b = map.getBounds();
+    for (let z = z0 + 1; z <= maxZ; z++) {
+      const r = tileRangeForBounds(b, z);
+      for (let x = r.xmin; x <= r.xmax; x++) for (let y = r.ymin; y <= r.ymax; y++) {
+        const u = tileUrl(z, x, y, ymd, hours);
+        if (prefetched.has(u)) continue;
         prefetched.add(u);
-        prefetchPush(()=>fetch(u,{cache:"force-cache"}));
+        prefetchPush(() => fetch(u, { cache: "force-cache", signal: prefetchController.signal }).catch(() => {}));
       }
     }
   }
 
-  function debounce(fn,ms){let t=0;return()=>{clearTimeout(t);t=setTimeout(fn,ms)}}
-  const prefetchDebounced=debounce(prefetchViewportTiles,250);
+  function debounce(fn, ms) { let t = 0; return () => { clearTimeout(t); t = setTimeout(fn, ms); }; }
+  const prefetchDebounced = debounce(prefetchViewportTiles, 250);
 
-  map.on("load",()=>muteRoads(map));
-  map.on("styledata",()=>muteRoads(map));
+  map.on("load", () => {
+    muteRoads(map);
+    hideCountryLabels(map);
+  });
+  map.on("styledata", () => {
+    muteRoads(map);
+    hideCountryLabels(map);
+  });
 
-  const LEGENDS={
-    "24":{
-      colors:["#dcdcdc","#990000","#cc3333","#ff6666","#cccc66","#ff8c00","#ffff66","#99ff99","#00ff00","#66cc66","#6666ff","#3333cc","#000099","#990099","#4b0082","#2f004f","#000000"],
-      labels:["0.00 to trace","trace to 0.02","0.02 to 0.04","0.04 to 0.08","0.08 to 0.12","0.12 to 0.16","0.16 to 0.20","0.20 to 0.39","0.39 to 0.59","0.59 to 0.79","0.79 to 0.98","0.98 to 1.4","1.4 to 2.0","2.0 to 3.0","3.0 to 4.0","4.0 to 5.0","> 5.0"]
+  const LEGENDS = {
+    "24": {
+      colors: ["#dcdcdc", "#990000", "#cc3333", "#ff6666", "#cccc66", "#ff8c00", "#ffff66", "#99ff99", "#00ff00", "#66cc66", "#6666ff", "#3333cc", "#000099", "#990099", "#4b0082", "#2f004f", "#000000"],
+      labels: ["0.00 to trace", "trace to 0.02", "0.02 to 0.04", "0.04 to 0.08", "0.08 to 0.12", "0.12 to 0.16", "0.16 to 0.20", "0.20 to 0.39", "0.39 to 0.59", "0.59 to 0.79", "0.79 to 0.98", "0.98 to 1.4", "1.4 to 2.0", "2.0 to 3.0", "3.0 to 4.0", "4.0 to 5.0", "> 5.0"]
     },
-    "72":{
-      colors:["#dcdcdc","#990000","#cc3333","#ff6666","#cccc66","#ff8c00","#ffff66","#99ff99","#00ff00","#66cc66","#6666ff","#3333cc","#000099","#990099","#4b0082","#2f004f","#000000"],
-      labels:["0.00 to trace","trace to 0.04","0.04 to 0.08","0.08 to 0.16","0.16 to 0.24","0.24 to 0.31","0.31 to 0.39","0.39 to 0.79","0.79 to 1.4","1.4 to 2.0","2.0 to 3.0","3.0 to 3.9","3.9 to 5.0","5.0 to 6.5","6.5 to 8.0","8.0 to 9.8","> 9.8"]
+    "72": {
+      colors: ["#dcdcdc", "#990000", "#cc3333", "#ff6666", "#cccc66", "#ff8c00", "#ffff66", "#99ff99", "#00ff00", "#66cc66", "#6666ff", "#3333cc", "#000099", "#990099", "#4b0082", "#2f004f", "#000000"],
+      labels: ["0.00 to trace", "trace to 0.04", "0.04 to 0.08", "0.08 to 0.16", "0.16 to 0.24", "0.24 to 0.31", "0.31 to 0.39", "0.39 to 0.79", "0.79 to 1.4", "1.4 to 2.0", "2.0 to 3.0", "3.0 to 3.9", "3.9 to 5.0", "5.0 to 6.5", "6.5 to 8.0", "8.0 to 9.8", "> 9.8"]
     }
   };
 
-  function renderLegend(hours){
-    const L=LEGENDS[String(hours)]||LEGENDS["24"];
-    legendGrid.innerHTML="";
-    for(let i=0;i<L.colors.length;i++){
-      const sw=document.createElement("div");sw.className="swatch";sw.style.background=L.colors[i];
-      const lb=document.createElement("div");lb.className="legend-label";lb.textContent=L.labels[i]||"";
-      legendGrid.appendChild(sw);legendGrid.appendChild(lb);
+  function renderLegend(hours) {
+    const L = LEGENDS[String(hours)] || LEGENDS["24"];
+    legendGrid.innerHTML = "";
+    for (let i = 0; i < L.colors.length; i++) {
+      const sw = document.createElement("div"); sw.className = "swatch"; sw.style.background = L.colors[i];
+      sw.setAttribute("role", "listitem");
+      const lb = document.createElement("div"); lb.className = "legend-label"; lb.textContent = L.labels[i] || "";
+      legendGrid.appendChild(sw); legendGrid.appendChild(lb);
     }
   }
 
-  function getHours(){const el=document.querySelector('input[name="hours"]:checked');return el?parseInt(el.value,10):24}
-  function selectedDateYMD(){const y=yearSel.value,m=monthSel.value,d=daySel.value; if(!y||!m||!d)return null; return`${y}${m}${d}`}
-  function subtitleText(yyyymmdd,hours){const y=yyyymmdd.slice(0,4),m=yyyymmdd.slice(4,6),d=yyyymmdd.slice(6,8);return`${hours} Hour snowmelt ending on ${y}-${m}-${d} 05Z`}
+  function getHours() { const el = document.querySelector('input[name="hours"]:checked'); return el ? parseInt(el.value, 10) : 24; }
+  function selectedDateYMD() { const y = yearSel.value, m = monthSel.value, d = daySel.value; if (!y || !m || !d) return null; return `${y}${m}${d}`; }
+  function subtitleText(yyyymmdd, hours) { const y = yyyymmdd.slice(0, 4), m = yyyymmdd.slice(4, 6), d = yyyymmdd.slice(6, 8); return `${hours} Hour snowmelt ending on ${y}-${m}-${d} 05Z`; }
 
-  async function addCnTracksVectorTiles(){
+  function addCnTracksVectorTiles() {
     const SRC = "cn_tracks_vt";
-    const CN_MAX_ZOOM = 7;
-
     if (map.getSource(SRC)) return;
-
+  
     map.addSource(SRC, {
       type: "vector",
       tiles: [`${VALUE_BASE}/cn_tiles/{z}/{x}/{y}.pbf`],
+      tileSize: 512,
       minzoom: 0,
       maxzoom: 7,
       bounds: [-170, 29, -63, 90]
     });
-
-    map.addLayer({
-      id: CN_LINE_GLOW,
-      type: "line",
-      source: SRC,
-      "source-layer": "cn_tracks",
-      minzoom: 0,
-      maxzoom: 24,
-      layout: { "line-join": "round", "line-cap": "round" },
-      paint: {
-        "line-color": "#ff0000",
-        "line-opacity": 0.85,
-        "line-blur": 2.0,
-        "line-width": ["interpolate", ["linear"], ["zoom"], 4, 2.0, 6, 4.0, 8, 6.0, 10, 8.0, 12, 10.0, 14, 12.0]
-      }
-    });
-
-    map.addLayer({
-      id: CN_LINE,
-      type: "line",
-      source: SRC,
-      "source-layer": "cn_tracks",
-      minzoom: 0,
-      maxzoom: 24,
-      layout: { "line-join": "round", "line-cap": "round" },
-      paint: {
-        "line-color": "#ffffff",
-        "line-opacity": 0.95,
-        "line-width": ["interpolate", ["linear"], ["zoom"], 4, 0.8, 6, 1.6, 8, 2.4, 10, 3.2, 12, 4.0, 14, 4.8]
-      }
-    });
+  
+    if (!map.getLayer(CN_LINE_GLOW)) {
+      map.addLayer({
+        id: CN_LINE_GLOW,
+        type: "line",
+        source: SRC,
+        "source-layer": "cn_tracks",
+        minzoom: 0,
+        maxzoom: 24,
+        layout: { "line-join": "round", "line-cap": "round" },
+        paint: {
+          "line-color": "#ff0000",
+          "line-opacity": 0.85,
+          "line-blur": 2.0,
+          "line-width": ["interpolate", ["linear"], ["zoom"], 4, 2.0, 6, 4.0, 8, 6.0, 10, 8.0, 12, 10.0, 14, 12.0]
+        }
+      });
+    }
+  
+    if (!map.getLayer(CN_LINE)) {
+      map.addLayer({
+        id: CN_LINE,
+        type: "line",
+        source: SRC,
+        "source-layer": "cn_tracks",
+        minzoom: 0,
+        maxzoom: 24,
+        layout: { "line-join": "round", "line-cap": "round" },
+        paint: {
+          "line-color": "#ffffff",
+          "line-opacity": 0.95,
+          "line-width": ["interpolate", ["linear"], ["zoom"], 4, 0.8, 6, 1.6, 8, 2.4, 10, 3.2, 12, 4.0, 14, 4.8]
+        }
+      });
+    }
   }
 
-  function setOpacity(v){OPV.textContent=v.toFixed(2);if(map.getLayer(LAYER_ID))map.setPaintProperty(LAYER_ID,"raster-opacity",v)}
 
-  let selGen=0;
+  function setOpacity(v) { 
+    OPV.textContent = v.toFixed(2); 
+    if (lastRasterLayerId && map.getLayer(lastRasterLayerId))
+    {map.setPaintProperty(lastRasterLayerId, "raster-opacity", parseFloat(OPACITY.value));}
+  }
 
-    function setTilesForSelection(){
+
+
+  function setTilesForSelection() {
     const ymd = selectedDateYMD();
     const hours = getHours();
-    if(!ymd) return;
+  
+    if (prefetchController) prefetchController.abort();
+    prefetchController = new AbortController();
+  
+    try { prefetchRawController.abort(); } catch {}
+    prefetchRawController = new AbortController();
 
+  
+    if (rawPrefetchTimer) clearTimeout(rawPrefetchTimer);
+  
+    if (!ymd) return;
+  
     selGen++;
+    cancelRawInflightExcept(ymd, hours);
+
+    notifyActiveDate(ymd);
     subtitle.textContent = subtitleText(ymd, hours);
     renderLegend(hours);
-
+  
     cursorEl.style.display = "none";
     lastKey = "";
-
+  
     const tiles = [
-      `/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${encodeURIComponent(ymd)}&hours=${encodeURIComponent(hours)}&dom=${encodeURIComponent(DOM)}`
+      `/tiles/forecast/by_date/{z}/{x}/{y}.png?date_yyyymmdd=${encodeURIComponent(ymd)}&hours=${encodeURIComponent(hours)}&dom=${encodeURIComponent(DOM)}&v=${selGen}`
     ];
-
-    // Remove and re-add to force tile refresh
-    if (map.getLayer(LAYER_ID)) {
-      map.removeLayer(LAYER_ID);
-    }
-    if (map.getSource(SRC_ID)) {
-      map.removeSource(SRC_ID);
-    }
-
-    // Small delay to ensure removal completes
-    setTimeout(() => {
-      map.addSource(SRC_ID, {
+  
+    const srcId = `${SRC_ID}_${selGen}`;
+    const layerId = `${LAYER_ID}_${selGen}`;
+  
+    requestAnimationFrame(() => {
+      if (lastRasterLayerId && map.getLayer(lastRasterLayerId)) {
+        map.removeLayer(lastRasterLayerId);
+      }
+      if (lastRasterSrcId && map.getSource(lastRasterSrcId)) {
+        map.removeSource(lastRasterSrcId);
+      }
+  
+      map.addSource(srcId, {
         type: "raster",
         tiles: tiles,
         tileSize: 256,
         maxzoom: 12,
         bounds: [-170, 29, -40, 90]
       });
-
+  
       map.addLayer({
-        id: LAYER_ID,
+        id: layerId,
         type: "raster",
-        source: SRC_ID,
+        source: srcId,
         paint: {
-          "raster-opacity": parseFloat(OPACITY.value)
+          "raster-opacity": parseFloat(OPACITY.value),
+          "raster-fade-duration": 0
         }
       });
-
+  
       if (map.getLayer(CN_LINE_GLOW)) {
-        map.moveLayer(LAYER_ID, CN_LINE_GLOW);
+        map.moveLayer(layerId, CN_LINE_GLOW);
       }
-    }, 50);
-
+  
+      lastRasterSrcId = srcId;
+      lastRasterLayerId = layerId;
+    });
+  
     prefetched.clear();
     prefetchViewportTiles();
+  
     rawPrefetched.clear();
-    prefetchViewportRawTiles();
-  }
+    rawPrefetchTimer = setTimeout(() => prefetchViewportRawTiles(), 2000);
+}
 
-  function setSelectOptions(sel,options,value,disabledSet){
-    sel.innerHTML="";
-    for(const opt of options){
-      const o=document.createElement("option");
-      o.value=opt.value;o.textContent=opt.label;
-      if(disabledSet&&disabledSet.has(opt.value))o.disabled=true;
+
+  function setSelectOptions(sel, options, value, disabledSet) {
+    sel.innerHTML = "";
+    for (const opt of options) {
+      const o = document.createElement("option");
+      o.value = opt.value; o.textContent = opt.label;
+      if (disabledSet && disabledSet.has(opt.value)) o.disabled = true;
       sel.appendChild(o);
     }
-    if(value)sel.value=value;
+    if (value) sel.value = value;
   }
 
-  function monthName(m){const names=["January","February","March","April","May","June","July","August","September","October","November","December"];return names[parseInt(m,10)-1]||m}
-
-  let available=[],availableSet=new Set();
-
-  function recomputeDayOptions(){
-    const y=yearSel.value,m=monthSel.value; if(!y||!m)return;
-    const days=[],disabled=new Set(),monthDays=31;
-    for(let dd=1;dd<=monthDays;dd++){
-      const d2=z2(dd),ymd=`${y}${m}${d2}`;
-      days.push({value:d2,label:String(dd)});
-      if(!availableSet.has(ymd))disabled.add(d2);
-    }
-    const prev=daySel.value;
-    setSelectOptions(daySel,days,prev,disabled);
-    if(daySel.options[daySel.selectedIndex]&&daySel.options[daySel.selectedIndex].disabled){
-      const firstEnabled=Array.from(daySel.options).find(o=>!o.disabled);
-      if(firstEnabled)daySel.value=firstEnabled.value;
-    }
+  function monthName(m) {
+    const names = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    return names[parseInt(m, 10) - 1] || m;
   }
 
-  function recomputeMonthOptions(){
-    const y=yearSel.value,months=[],disabled=new Set();
-    for(let mm=1;mm<=12;mm++){
-      const m2=z2(mm);
-      months.push({value:m2,label:monthName(m2)});
-      const hasAny=available.some(d=>d.startsWith(`${y}${m2}`));
-      if(!hasAny)disabled.add(m2);
+  let available = [], availableSet = new Set();
+
+  function recomputeDayOptions() {
+    const y = yearSel.value, m = monthSel.value; if (!y || !m) return;
+    const days = [], disabled = new Set(), monthDays = 31;
+    for (let dd = 1; dd <= monthDays; dd++) {
+      const d2 = z2(dd), ymd = `${y}${m}${d2}`;
+      days.push({ value: d2, label: String(dd) });
+      if (!availableSet.has(ymd)) disabled.add(d2);
     }
-    const prev=monthSel.value;
-    setSelectOptions(monthSel,months,prev,disabled);
-    if(monthSel.options[monthSel.selectedIndex]&&monthSel.options[monthSel.selectedIndex].disabled){
-      const firstEnabled=Array.from(monthSel.options).find(o=>!o.disabled);
-      if(firstEnabled)monthSel.value=firstEnabled.value;
+    const prev = daySel.value;
+    setSelectOptions(daySel, days, prev, disabled);
+    if (daySel.options[daySel.selectedIndex] && daySel.options[daySel.selectedIndex].disabled) {
+      const firstEnabled = Array.from(daySel.options).find(o => !o.disabled);
+      if (firstEnabled) daySel.value = firstEnabled.value;
     }
   }
 
-  function initSelectorsFromAvailable(){
-    availableSet=new Set(available);
-    const years=Array.from(new Set(available.map(d=>d.slice(0,4)))).sort();
-    setSelectOptions(yearSel,years.map(y=>({value:y,label:y})),years[years.length-1]);
-    recomputeMonthOptions();recomputeDayOptions();
-    const latest=available[available.length-1];
-    if(latest){
-      yearSel.value=latest.slice(0,4);
+  function recomputeMonthOptions() {
+    const y = yearSel.value, months = [], disabled = new Set();
+    for (let mm = 1; mm <= 12; mm++) {
+      const m2 = z2(mm);
+      months.push({ value: m2, label: monthName(m2) });
+      const hasAny = available.some(d => d.startsWith(`${y}${m2}`));
+      if (!hasAny) disabled.add(m2);
+    }
+    const prev = monthSel.value;
+    setSelectOptions(monthSel, months, prev, disabled);
+    if (monthSel.options[monthSel.selectedIndex] && monthSel.options[monthSel.selectedIndex].disabled) {
+      const firstEnabled = Array.from(monthSel.options).find(o => !o.disabled);
+      if (firstEnabled) monthSel.value = firstEnabled.value;
+    }
+  }
+
+  function ymdUtcPlusDays(days) {
+    const d = new Date();
+    const t = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + days);
+    const x = new Date(t);
+    const y = String(x.getUTCFullYear());
+    const m = z2(x.getUTCMonth() + 1);
+    const dd = z2(x.getUTCDate());
+    return `${y}${m}${dd}`;
+  }
+  
+  function initSelectorsFromAvailable() {
+    availableSet = new Set(available);
+  
+    const years = Array.from(new Set(available.map(d => d.slice(0, 4)))).sort();
+    setSelectOptions(yearSel, years.map(y => ({ value: y, label: y })), years[years.length - 1]);
+  
+    recomputeMonthOptions();
+    recomputeDayOptions();
+  
+    // ✅ Prefer tomorrow (UTC) if it exists, else latest available
+    const preferred = ymdUtcPlusDays(1);
+    const chosen = availableSet.has(preferred) ? preferred : available[available.length - 1];
+  
+    if (chosen) {
+      yearSel.value = chosen.slice(0, 4);
       recomputeMonthOptions();
-      monthSel.value=latest.slice(4,6);
+      monthSel.value = chosen.slice(4, 6);
       recomputeDayOptions();
-      daySel.value=latest.slice(6,8);
+      daySel.value = chosen.slice(6, 8);
     }
   }
 
-  async function loadAvailable(){
-    const r=await fetch(`${VALUE_BASE}/forecast/available_days?lookback_days=5`,{cache:"no-store"});
-    if(!r.ok)throw new Error(`forecast/available_days -> HTTP ${r.status}`);
-    const j=await r.json();
-    available=(j&&j.available_dates?j.available_dates:[]).slice();
+  let activeDateController = null;
+  let prefetchController = new AbortController();
+  let prefetchRawController = new AbortController();
+
+  function resetPrefetchControllers() {
+    try { prefetchController.abort(); } catch {}
+    try { prefetchRawController.abort(); } catch {}
+    prefetchController = new AbortController();
+    prefetchRawController = new AbortController();
+  }
+
+  function notifyActiveDate(ymd) {
+    try {
+      if (activeDateController) activeDateController.abort();
+      activeDateController = new AbortController();
+      fetch(`${VALUE_BASE}/ui/active_date`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_id: CLIENT_ID, date_yyyymmdd: ymd }),
+        signal: activeDateController.signal,
+        cache: "no-store",
+        keepalive: true
+      }).catch(() => {});
+    } catch {}
+  }
+
+  async function loadAvailable() {
+    const r = await fetch(`${VALUE_BASE}/forecast/available_days?lookback_days=5`, { cache: "no-store" });
+    if (!r.ok) throw new Error(`forecast/available_days -> HTTP ${r.status}`);
+    const j = await r.json();
+    available = (j && j.available_dates ? j.available_dates : []).slice();
     return j;
   }
 
-  function showCursorReadout(px,py,text){
-    cursorEl.style.left=px+"px";
-    cursorEl.style.top=py+"px";
-    if(!text){cursorEl.style.display="none";return}
-    cursorEl.textContent=text;
-    cursorEl.style.display="block";
+  function showCursorReadout(px, py, text) {
+    cursorEl.style.left = px + "px";
+    cursorEl.style.top = py + "px";
+    if (!text) { cursorEl.style.display = "none"; return; }
+    cursorEl.textContent = text;
+    cursorEl.style.display = "block";
   }
 
-    // ========== RAW TILE (NPZ) CLIENT-SIDE READOUT ==========
+  // ========== RAW TILE (NPZ) CLIENT-SIDE READOUT ==========
   const RAW_TILE_ZMAX = 12;
   const RAW_TILE_CACHE_MAX = 300;
-  const RAW_SCALE = 0.1; // tenths of an inch
 
   let hoverSeq = 0;
   let lastHoverKey = "";
   const HOVER_PIXEL_EPS = 2;
 
-  const RAW_NODATA = -32768;
-
-  let rawTileCache = new Map();   // key -> {q:Uint16Array, m:Uint8Array, shape:[h,w], scale:number}
+  let rawTileCache = new Map();
   let rawTileInflight = new Map();
 
-  function rawCacheKey(ymd, hours, z, x, y){ return `${ymd}|${hours}|${z}|${x}|${y}`; }
+  function rawCacheKey(ymd, hours, z, x, y) { return `${ymd}|${hours}|${z}|${x}|${y}`; }
+  function cancelRawInflightExcept(ymdKeep, hoursKeep) {
+    for (const [key, v] of rawTileInflight.entries()) {
+      try {
+        if (!v) continue;
+        if (v.ymd !== ymdKeep || String(v.hours) !== String(hoursKeep)) {
+          if (v.controller) v.controller.abort();
+          rawTileInflight.delete(key);
+        }
+      } catch {}
+    }
+  }
 
-  function rawCacheGet(key){
+  function rawCacheGet(key) {
     const v = rawTileCache.get(key);
-    if(!v) return null;
+    if (!v) return null;
     rawTileCache.delete(key);
     rawTileCache.set(key, v);
     return v;
   }
 
-  function rawCachePut(key, val){
-    if(rawTileCache.has(key)) rawTileCache.delete(key);
+  function rawCachePut(key, val) {
+    if (rawTileCache.has(key)) rawTileCache.delete(key);
     rawTileCache.set(key, val);
-    while(rawTileCache.size > RAW_TILE_CACHE_MAX){
+    while (rawTileCache.size > RAW_TILE_CACHE_MAX) {
       const first = rawTileCache.keys().next().value;
       rawTileCache.delete(first);
     }
   }
 
-  function lonLatToGlobalPixel(lon, lat, z){
+  function lonLatToGlobalPixel(lon, lat, z) {
     const scale = 256 * (1 << z);
     const x = (lon + 180) / 360 * scale;
     const s = Math.sin(lat * Math.PI / 180);
     const y = (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * scale;
-    return {x, y};
+    return { x, y };
   }
 
-  function parseNpy(u8){
+  function parseNpy(u8) {
     const magic = String.fromCharCode.apply(null, u8.slice(0, 6));
-    if(magic !== "\x93NUMPY") throw new Error("bad npy magic");
+    if (magic !== "\x93NUMPY") throw new Error("bad npy magic");
     const major = u8[6], minor = u8[7];
-
     let headerLen, offset;
-    if(major === 1){
+    if (major === 1) {
       headerLen = u8[8] | (u8[9] << 8);
       offset = 10;
     } else {
       headerLen = (u8[8] | (u8[9] << 8) | (u8[10] << 16) | (u8[11] << 24)) >>> 0;
       offset = 12;
     }
-
     const headerTxt = new TextDecoder("latin1").decode(u8.slice(offset, offset + headerLen));
     const dataOffset = offset + headerLen;
-
     const descrM = /'descr'\s*:\s*'([^']+)'/.exec(headerTxt);
     const fortranM = /'fortran_order'\s*:\s*(True|False)/.exec(headerTxt);
     const shapeM = /'shape'\s*:\s*\(([^)]*)\)/.exec(headerTxt);
-
-    if(!descrM || !shapeM) throw new Error("bad npy header");
+    if (!descrM || !shapeM) throw new Error("bad npy header");
     const descr = descrM[1];
     const fortran = fortranM ? (fortranM[1] === "True") : false;
-    if(fortran) throw new Error("fortran npy not supported");
-
+    if (fortran) throw new Error("fortran npy not supported");
     const shape = shapeM[1].split(",").map(s => s.trim()).filter(Boolean).map(n => parseInt(n, 10));
     const littleEndian = (descr[0] === "<" || descr[0] === "|");
-    if(!littleEndian) throw new Error("big-endian npy not supported");
-
+    if (!littleEndian) throw new Error("big-endian npy not supported");
     const typeCode = descr.slice(1);
-    return {typeCode, shape, dataOffset};
+    return { typeCode, shape, dataOffset };
   }
 
-  function parseNpz(ab){
-    if(!window.fflate) throw new Error("fflate missing");
+  function parseNpz(ab) {
+    if (!window.fflate) throw new Error("fflate missing");
     const files = window.fflate.unzipSync(new Uint8Array(ab));
-
-    // Expect q.npy (uint16), m.npy (uint8), s.npy (uint8) from _pack_raw_tile_npz
     const qn = Object.keys(files).find(n => /(^|\/)q\.npy$/.test(n));
     const mn = Object.keys(files).find(n => /(^|\/)m\.npy$/.test(n));
     const sn = Object.keys(files).find(n => /(^|\/)s\.npy$/.test(n));
-
-    if(!qn || !mn) throw new Error("npz missing q.npy or m.npy");
-
+    if (!qn || !mn) throw new Error("npz missing q.npy or m.npy");
     const qbuf = files[qn];
     const mbuf = files[mn];
-
     const qmeta = parseNpy(qbuf);
     const mmeta = parseNpy(mbuf);
-
     const qdata = qbuf.slice(qmeta.dataOffset);
     const mdata = mbuf.slice(mmeta.dataOffset);
-
-    if(qmeta.typeCode !== "u2") throw new Error("q.npy expected uint16");
-    if(mmeta.typeCode !== "u1") throw new Error("m.npy expected uint8");
-    if(qmeta.shape.length !== 2) throw new Error("q.npy not 2D");
-
+    if (qmeta.typeCode !== "u2") throw new Error("q.npy expected uint16");
+    if (mmeta.typeCode !== "u1") throw new Error("m.npy expected uint8");
+    if (qmeta.shape.length !== 2) throw new Error("q.npy not 2D");
     const q = new Uint16Array(qdata.buffer, qdata.byteOffset, qdata.byteLength / 2);
     const m = new Uint8Array(mdata.buffer, mdata.byteOffset, mdata.byteLength);
-
     let scale = 10;
-    if(sn && files[sn]){
-      try{
+    if (sn && files[sn]) {
+      try {
         const sbuf = files[sn];
         const smeta = parseNpy(sbuf);
         const sdata = sbuf.slice(smeta.dataOffset);
         const sarr = new Uint8Array(sdata.buffer, sdata.byteOffset, sdata.byteLength);
-        if(sarr.length) scale = sarr[0];
+        if (sarr.length) scale = sarr[0];
       } catch {}
     }
-
     return { q, m, shape: qmeta.shape, scale };
   }
 
-  async function loadRawTile(ymd, hours, z, x, y){
-    const key = rawCacheKey(ymd, hours, z, x, y);
-    const hit = rawCacheGet(key);
-    if(hit) return hit;
+async function loadRawTile(ymd, hours, z, x, y) {
+  const key = rawCacheKey(ymd, hours, z, x, y);
+  const hit = rawCacheGet(key);
+  if (hit) return hit;
 
-    if(rawTileInflight.has(key)) return rawTileInflight.get(key);
+  const infl = rawTileInflight.get(key);
+  if (infl && infl.promise) return infl.promise;
 
-    const p = (async () => {
+  const controller = new AbortController();
+  const p = (async () => {
+    try {
       const url = rawTileUrl(z, x, y, ymd, hours);
-      const r = await fetch(url, { cache: "force-cache" });
-      if(!r.ok) return null;
+      const r = await fetch(url, { cache: "force-cache", signal: controller.signal });
+
+      // ✅ Treat non-200 (including 204) as "no tile"
+      if (!r.ok || r.status !== 200) return null;
+
       const ab = await r.arrayBuffer();
+
+      // ✅ Guard against empty/partial responses
+      if (!ab || ab.byteLength < 16) return null;
+
       const tile = parseNpz(ab);
       rawCachePut(key, tile);
       return tile;
-    })().finally(() => rawTileInflight.delete(key));
+    } catch (e) {
+      return null;
+    }
+  })().finally(() => {
+    rawTileInflight.delete(key);
+  });
 
-    rawTileInflight.set(key, p);
-    return p;
-  }
+  rawTileInflight.set(key, { promise: p, controller, ymd, hours });
+  return p;
+}
 
-  function sampleRawTile(tile, px, py){
-    if(!tile || !tile.q || !tile.m || !tile.shape) return null;
+  function sampleRawTile(tile, px, py) {
+    if (!tile || !tile.q || !tile.m || !tile.shape) return null;
     const h = tile.shape[0], w = tile.shape[1];
-    if(px < 0 || py < 0 || px >= w || py >= h) return null;
-
+    if (px < 0 || py < 0 || px >= w || py >= h) return null;
     const idx = py * w + px;
-    if(tile.m[idx] === 0) return null;
-
+    if (tile.m[idx] === 0) return null;
     const tenths = tile.q[idx];
     const inches = tenths / (tile.scale || 10);
-    if(!isFinite(inches)) return null;
+    if (!isFinite(inches)) return null;
     return inches;
   }
 
   const prefetchRawPush = makeQueue(12);
   const rawPrefetched = new Set();
 
-  function prefetchViewportRawTiles(){
-    if(map.getZoom() < PREFETCH_ZMIN) return;
+  function prefetchViewportRawTiles() {
+    if (map.getZoom() < PREFETCH_ZMIN) return;
     const ymd = selectedDateYMD();
-    if(!ymd) return;
+    if (!ymd) return;
     const hours = getHours();
-
     const z = Math.min(RAW_TILE_ZMAX, Math.max(0, Math.floor(map.getZoom())));
     const b = map.getBounds();
     const r = tileRangeForBounds(b, z);
-
-    for(let x=r.xmin; x<=r.xmax; x++){
-      for(let y=r.ymin; y<=r.ymax; y++){
+    for (let x = r.xmin; x <= r.xmax; x++) {
+      for (let y = r.ymin; y <= r.ymax; y++) {
         const u = rawTileUrl(z, x, y, ymd, hours);
-        if(rawPrefetched.has(u)) continue;
+        if (rawPrefetched.has(u)) continue;
         rawPrefetched.add(u);
-        prefetchRawPush(() => loadRawTile(ymd, hours, z, x, y));
+        prefetchRawPush(() => {
+          if (prefetchRawController.signal.aborted) return;
+          return loadRawTile(ymd, hours, z, x, y);
+        });
+
       }
     }
   }
 
   const prefetchRawDebounced = debounce(prefetchViewportRawTiles, 200);
 
-  async function updateCursorReadout(lngLat, point, seq){
+  async function updateCursorReadout(lngLat, point, seq) {
     if (seq !== hoverSeq) return;
-
     if (map.getZoom() < CURSOR_ZMIN) { showCursorReadout(point.x, point.y, ""); return; }
     if (!tracksReady()) { showCursorReadout(point.x, point.y, ""); return; }
     if (!nearTrack(point, lngLat)) { showCursorReadout(point.x, point.y, ""); return; }
-
     const ymd = selectedDateYMD();
     if (!ymd) { showCursorReadout(point.x, point.y, ""); return; }
     const hours = getHours();
-
     const z = Math.min(RAW_TILE_ZMAX, Math.max(0, Math.floor(map.getZoom())));
     const max = (1 << z) - 1;
     const tx = clamp(lon2tile(lngLat.lng, z), 0, max);
     const ty = clamp(lat2tile(lngLat.lat, z), 0, max);
-
     const gp = lonLatToGlobalPixel(lngLat.lng, lngLat.lat, z);
     const px = Math.floor(gp.x - (tx * 256));
     const py = Math.floor(gp.y - (ty * 256));
-
     const tile = await loadRawTile(ymd, hours, z, tx, ty);
     if (seq !== hoverSeq) return;
-
     const inches = sampleRawTile(tile, px, py);
     if (inches != null && inches > TRACE_INCHES) {
       showCursorReadout(point.x, point.y, inches.toFixed(1) + " in");
@@ -783,20 +971,20 @@
     }
   }
 
-  function onSelectionChange(){
+  function onSelectionChange() {
     rawPrefetched.clear();
     prefetchViewportRawTiles();
   }
 
-  function shouldReadout(){
-    const z=map.getZoom();
-    const ok=z>=MIN_ZOOM_FOR_READOUT;
-    if(!ok&&readoutsEnabled){
-      readoutsEnabled=false;
-      lastKey="";
-      showCursorReadout(0,0,"");
-    } else if(ok&&!readoutsEnabled){
-      readoutsEnabled=true;
+  function shouldReadout() {
+    const z = map.getZoom();
+    const ok = z >= MIN_ZOOM_FOR_READOUT;
+    if (!ok && readoutsEnabled) {
+      readoutsEnabled = false;
+      lastKey = "";
+      showCursorReadout(0, 0, "");
+    } else if (ok && !readoutsEnabled) {
+      readoutsEnabled = true;
     }
     return ok;
   }
@@ -806,17 +994,13 @@
       cursorEl.style.left = e.point.x + "px";
       cursorEl.style.top = e.point.y + "px";
     }
-  
     if (!shouldReadout()) return;
     if (!tracksReady()) return;
-  
-    // Simple jitter gate so we don’t spam async calls on micro-moves
     const px = Math.round(e.point.x);
     const py = Math.round(e.point.y);
     const ymd = selectedDateYMD();
     const hours = getHours();
     if (!ymd) return;
-  
     const key = `${ymd}|${hours}|${px}|${py}`;
     if (lastHoverKey) {
       const parts = lastHoverKey.split("|");
@@ -827,24 +1011,21 @@
       }
     }
     lastHoverKey = key;
-  
     const mySeq = ++hoverSeq;
     updateCursorReadout(e.lngLat, e.point, mySeq);
   });
 
   map.on("mouseout", () => {
     showCursorReadout(0, 0, "");
-    pendingCursorUpdate = null;
   });
 
   map.on("moveend", () => {
     prefetchRawDebounced();
   });
 
-
   map.on("zoomend", () => {
     shouldReadout();
-    if(map.getZoom()<CURSOR_ZMIN){lastKey="";showCursorReadout(0,0,"")}
+    if (map.getZoom() < CURSOR_ZMIN) { lastKey = ""; showCursorReadout(0, 0, ""); }
     prefetchDebounced();
     prefetchRawDebounced();
   });
@@ -855,63 +1036,102 @@
       console.warn("Tile not found:", err);
       return;
     }
+    // Don't show timeout errors to user - they're expected for some tiles
+    if (err && err.message && (err.message.includes("timeout") || err.message.includes("TIMED_OUT"))) {
+      console.warn("Tile timeout:", err);
+      return;
+    }
     showErr("Map error:\n" + (err ? err.message : String(e)));
   });
 
-  map.on("load",async()=>{
-    try{
-      showLoading(true);
+  // === MAIN INITIALIZATION - PARALLELIZED ===
+  map.on("load", async () => {
+    try {
+      setProgress(40, 'Loading map style...');
       renderLegend(24);
 
-      const availPromise=loadAvailable();
-      await addCnTracksVectorTiles();
-
+      // Start BOTH fetches in parallel - don't await tracks
+      const availPromise = loadAvailable();
+      
+      setProgress(50, 'Loading track network...');
+      // Add tracks NON-BLOCKING - they'll render when ready
+      addCnTracksVectorTiles();
+      
+      setProgress(60, 'Fetching available dates...');
       await availPromise;
-      if(!available.length){showErr("No available days returned from /forecast/available_days");return}
+      
+      if (!available.length) {
+        showErr("No available days returned from /forecast/available_days");
+        hideInitialLoading();
+        return;
+      }
 
+      setProgress(80, 'Loading snowmelt tiles...');
       initSelectorsFromAvailable();
       setTilesForSelection();
       prefetchViewportTiles();
       setOpacity(parseFloat(OPACITY.value));
       shouldReadout();
-      // Delay raw tile prefetch so PNG tiles load first
+      
+      setProgress(100, 'Ready!');
+      
+      // Hide loading screen once map is interactive
+      setTimeout(() => hideInitialLoading(), 300);
+      
+      // Delay raw tile prefetch so visual tiles load first
       setTimeout(() => onSelectionChange(), 3000);
       
-      // Hide loading after tiles start loading, with fallback timeout
-      setTimeout(() => showLoading(false), 2000);
-    } catch(e){
-      showErr("Init error:\n"+String(e));
-      showLoading(false);
+    } catch (e) {
+      showErr("Init error:\n" + String(e));
+      hideInitialLoading();
     }
   });
+
+  const debouncedTileUpdate = debounce(() => {
+    const ymd = selectedDateYMD();
+    const hours = getHours();
+    if (!ymd) return;
+  
+    // Cancel all old work immediately
+    resetPrefetchControllers();
+    prefetchPush.clear();
+    prefetchRawPush.clear();
+    prefetched.clear();
+    rawPrefetched.clear();
+    cancelRawInflightExcept(ymd, hours);
+  
+    setTilesForSelection();
+  
+    // Kick raw prefetch after visuals settle
+    setTimeout(() => onSelectionChange(), 800);
+  }, 100);
 
   yearSel.addEventListener("change", () => {
     recomputeMonthOptions();
     recomputeDayOptions();
-    setTilesForSelection();
-    setTimeout(() => onSelectionChange(), 1500);
+    debouncedTileUpdate();
   });
   
   monthSel.addEventListener("change", () => {
     recomputeDayOptions();
-    setTilesForSelection();
-    setTimeout(() => onSelectionChange(), 1500);
+    debouncedTileUpdate();
   });
   
   daySel.addEventListener("change", () => {
-    setTilesForSelection();
-    setTimeout(() => onSelectionChange(), 1500);
+    debouncedTileUpdate();
   });
   
   document.querySelectorAll('input[name="hours"]').forEach(el => 
     el.addEventListener("change", () => {
-      setTilesForSelection();
-      setTimeout(() => onSelectionChange(), 1500);
+      debouncedTileUpdate();
     })
   );
 
-  OPACITY.addEventListener("input",()=>setOpacity(parseFloat(OPACITY.value)));
-})();
+  OPACITY.addEventListener("input", () => setOpacity(parseFloat(OPACITY.value)));
+
+  // Mark performance timing
+  performance.mark('fullLoad');
+});
 </script>
 
 </body>
