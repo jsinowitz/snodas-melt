@@ -1,13 +1,13 @@
 from __future__ import annotations
 import calendar, gzip, io, os, random, re, sys, tarfile, tempfile, threading, time, requests, json, rasterio, rioxarray, math
-from collections import deque
+from collections import deque, OrderedDict
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Callable
 import numpy as np
 import xarray as xr
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Response, Body
 from fastapi.staticfiles import StaticFiles
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
@@ -27,22 +27,19 @@ import sqlite3
 from rio_tiler.colormap import cmap
 from typing import Any
 import concurrent.futures
-
-# from PIL import Image
-# supposed to import mercantile? Says there isnt a module named mercantile, same with PIL above
-
+from fastapi.responses import Response as FastResponse
+from pydantic import BaseModel
+from starlette.responses import Response
 LOCAL_TZ = ZoneInfo(os.environ.get("LOCAL_TZ", "America/Chicago"))
-LOWRES_Z = int(os.environ.get("LOWRES_Z", "6"))         # serve off-track as z=6 tile
+LOWRES_Z = int(os.environ.get("LOWRES_Z", "6"))
 LOWRES_MAX_REQUEST_Z = int(os.environ.get("LOWRES_MAX_REQUEST_Z", "14"))
-LOWRES_BOX_ZMIN = int(os.environ.get("LOWRES_BOX_ZMIN", "4"))  # pre-bake lowres tiles at these zooms
+LOWRES_BOX_ZMIN = int(os.environ.get("LOWRES_BOX_ZMIN", "4"))
 LOWRES_BOX_ZMAX = int(os.environ.get("LOWRES_BOX_ZMAX", "6"))
 HF_MAX_OPS_PER_COMMIT = int(os.environ.get("HF_MAX_OPS_PER_COMMIT", "300"))
 HF_PUSH_SLEEP_SEC = float(os.environ.get("HF_PUSH_SLEEP_SEC", "0.5"))
-
-ROLL_WINDOW_DAYS = int(os.environ.get("ROLL_WINDOW_DAYS", "2"))  # yesterday..+2
-SCHEDULE_HOUR_LOCAL = int(os.environ.get("SCHEDULE_HOUR_LOCAL", "1"))  # 7am local
+ROLL_WINDOW_DAYS = int(os.environ.get("ROLL_WINDOW_DAYS", "5"))
+SCHEDULE_HOUR_LOCAL = int(os.environ.get("SCHEDULE_HOUR_LOCAL", "7")) 
 SCHEDULE_MIN_LOCAL = int(os.environ.get("SCHEDULE_MIN_LOCAL", "0"))
-
 WARM_ZMIN = int(os.environ.get("WARM_ZMIN", "6"))
 WARM_ZMAX = int(os.environ.get("WARM_ZMAX", "12"))
 WARM_RADIUS = int(os.environ.get("WARM_RADIUS", "1"))
@@ -50,25 +47,56 @@ WARM_CAP_PER_ZOOM = int(os.environ.get("WARM_CAP_PER_ZOOM", "7000"))
 WARM_MAX_TILES_TOTAL = int(os.environ.get("WARM_MAX_TILES_TOTAL", "50000"))
 WARM_DOM = os.environ.get("WARM_DOM", "zz").lower()
 WARM_MILES = float(os.environ.get("WARM_MILES", "8"))
-# BOOT_ROLL_DEFAULT = os.environ.get("RUN_BOOT_ROLL", "1")
-BOOT_ROLL_DEFAULT = os.environ.get("RUN_BOOT_ROLL", "1")
-
-# Corridor prewarm hours (24 and 72)
+BOOT_ROLL_DEFAULT = os.environ.get("RUN_BOOT_ROLL", "0")
 WARM_HOURS_LIST = [24, 72]
 CN_MBTILES_LOCAL = Path("cache") / "tracks" / "cn_tracks.mbtiles"
 CN_MBTILES_REPO_PATH = "tracks/cn_tracks.mbtiles"
 CN_BOUNDS_REPO_PATH = "tracks/cn_tracks.bounds.txt"
 _VIEWGRID_LOCK = threading.Lock()
-_VIEWGRID_CACHE: dict[tuple, tuple[float, Any]] = {}   # key -> (ts, response)
+_VIEWGRID_CACHE: dict[tuple, tuple[float, Any]] = {}
 _VIEWGRID_TTL_S = 45.0
-
 _MELTCOGS_LOCK = threading.Lock()
-_MELTCOGS_CACHE: dict[tuple, tuple[float, Any]] = {}   # key -> (ts, melt_cogs)
+_MELTCOGS_CACHE: dict[tuple, tuple[float, Any]] = {}
 _MELTCOGS_TTL_S = 300.0
-
-# How long to keep tile PNGs and forecast COGs (days of YYYYMMDD date keys)
-KEEP_TILE_DAYS = int(os.environ.get("KEEP_TILE_DAYS", "5"))     # keeps a little extra buffer
+KEEP_TILE_DAYS = int(os.environ.get("KEEP_TILE_DAYS", "5"))
 KEEP_FORECAST_COG_DAYS = int(os.environ.get("KEEP_FORECAST_COG_DAYS", "5"))
+_COGREADER_CACHE_MAX = int(os.environ.get("COGREADER_CACHE_MAX", "12"))
+_COGREADER_CACHE: "OrderedDict[str, COGReader]" = OrderedDict()
+_COGREADER_CACHE_LK = threading.Lock()
+ROLL_SINGLETON_KEY = "roll_job"
+_ACTIVE_CLIENT: dict[str, dict[str, Any]] = {}
+_ACTIVE_CLIENT_LK = threading.Lock()
+_ACTIVE_CLIENT_TTL_S = 180.0
+def _pick_cache_root() -> Path:
+    env = (os.environ.get("SNODAS_CACHE") or "").strip()
+    candidates = ([env] if env else []) + ["/data/snodas-cache", "/home/user/snodas-cache", "/tmp/snodas-cache", "./cache"]
+    for c in candidates:
+        p = Path(c).expanduser()
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            t = p / ".wtest"
+            t.write_text("ok")
+            t.unlink(missing_ok=True)
+            return p.resolve()
+        except Exception:
+            pass
+    return Path(tempfile.mkdtemp(prefix="snodas-cache-")).resolve()
+CACHE = _pick_cache_root()
+def _client_mark_active(client_id: str, active_date: str) -> None:
+    now = time.time()
+    with _ACTIVE_CLIENT_LK:
+        _ACTIVE_CLIENT[client_id] = {"date": active_date, "ts": now}
+
+
+def _client_is_active_date(client_id: str, date_yyyymmdd: str) -> bool:
+    now = time.time()
+    with _ACTIVE_CLIENT_LK:
+        st = _ACTIVE_CLIENT.get(client_id)
+        if not st:
+            return True  # if unknown, don't block
+        if (now - float(st.get("ts", 0.0))) > _ACTIVE_CLIENT_TTL_S:
+            return True
+        return str(st.get("date", "")) == str(date_yyyymmdd)
 
 CACHE_CONTROL_BY_DATE = os.environ.get(
     "CACHE_CONTROL_BY_DATE",
@@ -79,7 +107,103 @@ CACHE_CONTROL_LATEST = os.environ.get(
     "public, max-age=900",
 )
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_COG_LRU_MAX = int(os.environ.get("COGREADER_LRU_MAX", "24"))
+_COG_LRU: "OrderedDict[str, COGReader]" = OrderedDict()
+_COG_LRU_LK = threading.Lock()
+def _cogreader_lru_get(cog: Path) -> COGReader:
+    key = cog.as_posix()
+    with _COG_LRU_LK:
+        r = _COG_LRU.get(key)
+        if r is not None:
+            _COG_LRU.move_to_end(key, last=True)
+            return r
 
+        r = COGReader(key)
+        _COG_LRU[key] = r
+        _COG_LRU.move_to_end(key, last=True)
+
+        while len(_COG_LRU) > _COG_LRU_MAX:
+            _, old = _COG_LRU.popitem(last=False)
+            try:
+                old.close()
+            except Exception:
+                pass
+
+        return r
+
+def _cogreader_lru_clear() -> None:
+    with _COG_LRU_LK:
+        for r in _COG_LRU.values():
+            try:
+                r.close()
+            except Exception:
+                pass
+        _COG_LRU.clear()
+
+class CogCache:
+    def __init__(self):
+        self._datasets: dict[str, COGReader] = {}
+
+    def get(self, cog: Path) -> COGReader:
+        key = cog.as_posix()
+        r = self._datasets.get(key)
+        if r is None:
+            r = COGReader(key)
+            self._datasets[key] = r
+        return r
+        
+    def evict(self, path: Path) -> None:
+        key = str(path)
+        ds = self._datasets.pop(key, None)
+        if ds is not None:
+            try: ds.close()
+            except Exception: pass
+
+    def close_all(self):
+        for r in self._datasets.values():
+            try:
+                r.close()
+            except Exception:
+                pass
+        self._datasets.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close_all()
+        
+COG_CACHE = CogCache()
+
+def _cogreader_get(path: Path) -> COGReader:
+    key = path.as_posix()
+    with _COGREADER_CACHE_LK:
+        r = _COGREADER_CACHE.get(key)
+        if r is not None:
+            _COGREADER_CACHE.move_to_end(key, last=True)
+            return r
+
+        r = COGReader(key)
+        _COGREADER_CACHE[key] = r
+        _COGREADER_CACHE.move_to_end(key, last=True)
+
+        while len(_COGREADER_CACHE) > _COGREADER_CACHE_MAX:
+            old_key, old_r = _COGREADER_CACHE.popitem(last=False)
+            try:
+                old_r.close()
+            except Exception:
+                pass
+
+        return r
+
+def _cogreader_cache_clear() -> None:
+    with _COGREADER_CACHE_LK:
+        for r in _COGREADER_CACHE.values():
+            try:
+                r.close()
+            except Exception:
+                pass
+        _COGREADER_CACHE.clear()
 def _is_valid_png_file(p: Path) -> bool:
     try:
         if not p.exists():
@@ -92,6 +216,17 @@ def _is_valid_png_file(p: Path) -> bool:
         return head == PNG_MAGIC
     except Exception:
         return False
+def _ymd_from_cache_relpath(rel: str) -> str | None:
+    try:
+        parts = Path(rel).as_posix().split("/")
+        if len(parts) < 5:
+            return None
+        if parts[0] in ("tilecache", "rawtilecache"):
+            ymd = parts[3]
+            return ymd if re.fullmatch(r"[0-9]{8}", ymd) else None
+        return None
+    except Exception:
+        return None
 
 def _mem_cache_get(cache: dict, key: Any, ttl_s: int) -> Any | None:
     try:
@@ -129,9 +264,45 @@ def _tile_cache_key(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> s
     dom = (dom or "zz").lower()
     return f"bydate_{dom}_h{int(hours)}_{ymd}_z{int(z)}_{int(x)}_{int(y)}.png"
 
-def _tile_cache_path(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> Path:
-    return _tile_cache_dir() / _tile_cache_key(dom, hours, ymd, z, x, y)
-RAW_TILE_EXT = ".npz"
+def _tile_cache_path(
+    dom: str,
+    hours: int,
+    date_yyyymmdd: str,
+    z: int,
+    x: int,
+    y: int,
+) -> Path:
+    dom = (dom or "zz").lower()
+    return (
+        CACHE
+        / "tilecache"
+        / dom
+        / str(int(hours))
+        / date_yyyymmdd
+        / str(int(z))
+        / str(int(x))
+        / f"{int(y)}.png"
+    )
+
+def _raw_tile_cache_path(
+    dom: str,
+    hours: int,
+    date_yyyymmdd: str,
+    z: int,
+    x: int,
+    y: int,
+) -> Path:
+    dom = (dom or "zz").lower()
+    return (
+        CACHE
+        / "rawtilecache"
+        / dom
+        / str(int(hours))
+        / date_yyyymmdd
+        / str(int(z))
+        / str(int(x))
+        / f"{int(y)}.npz"
+    )
 
 def _raw_tile_cache_dir() -> Path:
     d = CACHE / "rawtilecache"
@@ -141,23 +312,6 @@ def _raw_tile_cache_dir() -> Path:
 def _raw_tile_cache_key(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> str:
     dom = (dom or "zz").lower()
     return f"bydate_{dom}_h{int(hours)}_{ymd}_z{int(z)}_{int(x)}_{int(y)}{RAW_TILE_EXT}"
-
-def _raw_tile_cache_path(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> Path:
-    return _raw_tile_cache_dir() / _raw_tile_cache_key(dom, hours, ymd, z, x, y)
-
-def _is_valid_npz_file(p: Path) -> bool:
-    try:
-        if not p.exists():
-            return False
-        st = p.stat()
-        if st.st_size < 60:
-            return False
-        # npz is a zip file; "PK" is a cheap sanity check
-        with p.open("rb") as f:
-            head = f.read(2)
-        return head == b"PK"
-    except Exception:
-        return False
 
 def _raw_tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> bytes | None:
     """
@@ -191,28 +345,206 @@ def _raw_tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) 
 
     return None
 
-def _tile_cache_put(dom: str, hours: int, ymd: str, z: int, x: int, y: int, png: bytes) -> None:
+def _tile_cache_put(dom, hours, ymd, z, x, y, png: bytes) -> Path:
     p = _tile_cache_path(dom, hours, ymd, z, x, y)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(png)
+    return p
+    
+def _raw_tile_cache_put(dom, hours, ymd, z, x, y, png: bytes) -> Path:
+    p = _raw_tile_cache_path(dom, hours, ymd, z, x, y)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(png)
+    return p
+
+_UPLOAD_STATE_DIR = CACHE / "_upload_state"
+_UPLOAD_STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _upload_manifest_path(date_yyyymmdd: str) -> Path:
+    return _UPLOAD_STATE_DIR / f"uploaded_{date_yyyymmdd}.json"
+
+def _load_upload_manifest(date_yyyymmdd: str) -> dict:
+    p = _upload_manifest_path(date_yyyymmdd)
+    if not p.exists():
+        return {"tilecache": {}, "rawtilecache": {}}
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_bytes(png)
-        tmp.replace(p)
+        return json.loads(p.read_text())
+    except Exception:
+        return {"tilecache": {}, "rawtilecache": {}}
+
+def _save_upload_manifest(date_yyyymmdd: str, manifest: dict) -> None:
+    try:
+        _upload_manifest_path(date_yyyymmdd).write_text(json.dumps(manifest, sort_keys=True))
     except Exception:
         pass
 
+def _hf_upload_folder_if_changed(
+    *,
+    local_folder: Path,
+    repo_path: str,
+    date_yyyymmdd: str,
+    kind: str,
+    dom: str,
+    hours: int,
+) -> dict:
+    tok, repo = _hf_cfg()
+    api = _hf_api()
+    if not tok or not repo or api is None:
+        return {"ok": False, "error": "hf_not_configured"}
 
+    if not local_folder.exists():
+        return {"ok": True, "skipped": True, "reason": "missing_local_folder"}
+
+    # No huge RAM lists: just scan once and keep minimal stats
+    file_count = 0
+    newest_mtime = 0.0
+    for p in local_folder.rglob("*"):
+        try:
+            if not p.is_file():
+                continue
+            if p.stat().st_size <= 0:
+                continue
+            file_count += 1
+            newest_mtime = max(newest_mtime, p.stat().st_mtime)
+        except Exception:
+            continue
+
+    if file_count <= 0:
+        return {"ok": True, "skipped": True, "reason": "empty_folder"}
+
+    manifest = _load_upload_manifest(date_yyyymmdd)
+    key = f"{dom}|{int(hours)}|{repo_path}"
+    prev = manifest.get(kind, {}).get(key)
+
+    if prev and prev.get("file_count") == file_count and prev.get("newest_mtime", 0.0) >= newest_mtime:
+        return {"ok": True, "skipped": True, "reason": "no_change"}
+
+    try:
+        api.upload_folder(
+            folder_path=str(local_folder),
+            repo_id=repo,
+            repo_type="dataset",
+            path_in_repo=repo_path,
+            token=tok,
+            commit_message=f"{kind}: upload {date_yyyymmdd} dom={dom} h={hours} ({file_count} files)",
+            allow_patterns=["**/*"],
+        )
+        manifest.setdefault(kind, {})[key] = {"file_count": file_count, "newest_mtime": newest_mtime}
+        _save_upload_manifest(date_yyyymmdd, manifest)
+        return {"ok": True, "skipped": False, "files": file_count}
+    except Exception as e:
+        _log("WARN", f"[hf_upload_folder] failed kind={kind} date={date_yyyymmdd} err={e!r}")
+        return {"ok": False, "error": repr(e)}
+
+def _hf_tiles_uploader_loop() -> None:
+    time.sleep(3.0)
+    _log("INFO", "[hf_uploader] start")
+    while True:
+        try:
+            now_local = datetime.now(LOCAL_TZ)
+            window = _rolling_dates_local_window(
+                today_local=now_local.date(),
+                days=int(ROLL_WINDOW_DAYS) if int(ROLL_WINDOW_DAYS) > 0 else 5,
+            )
+
+            dom = (WARM_DOM or "zz").lower()
+            hours_list = list(WARM_HOURS_LIST)
+
+            for ymd in window:
+                for h in hours_list:
+                    # tilecache
+                    local_tile = CACHE / "tilecache" / dom / str(int(h)) / ymd
+                    repo_tile = f"tilecache/{dom}/{int(h)}/{ymd}"
+                    _hf_upload_folder_if_changed(
+                        local_folder=local_tile,
+                        repo_path=repo_tile,
+                        date_yyyymmdd=ymd,
+                        kind="tilecache",
+                        dom=dom,
+                        hours=int(h),
+                    )
+
+                    # rawtilecache
+                    local_raw = CACHE / "rawtilecache" / dom / str(int(h)) / ymd
+                    repo_raw = f"rawtilecache/{dom}/{int(h)}/{ymd}"
+                    _hf_upload_folder_if_changed(
+                        local_folder=local_raw,
+                        repo_path=repo_raw,
+                        date_yyyymmdd=ymd,
+                        kind="rawtilecache",
+                        dom=dom,
+                        hours=int(h),
+                    )
+
+            _log("INFO", "[hf_uploader] sleep 30min")
+            time.sleep(30 * 60)
+
+        except Exception as e:
+            _log("WARN", f"[hf_uploader] crashed err={e!r}")
+            time.sleep(60)
+
+def _uploader_loop() -> None:
+    time.sleep(2.0)
+    _log("INFO", "[uploader] start")
+    while True:
+        try:
+            now_local = datetime.now(LOCAL_TZ)
+            window = _rolling_dates_local_window(
+                today_local=now_local.date(),
+                days=int(ROLL_WINDOW_DAYS) if int(ROLL_WINDOW_DAYS) > 0 else 5,
+            )
+
+            # Upload per date / dom / hours. Keep it simple: use your warm settings.
+            dom = (WARM_DOM or "zz").lower()
+            hours_list = list(WARM_HOURS_LIST)
+
+            for ymd in window:
+                for h in hours_list:
+                    # tilecache
+                    local_tile = CACHE / "tilecache" / dom / str(int(h)) / ymd
+                    repo_tile = f"tilecache/{dom}/{int(h)}/{ymd}"
+                    _hf_upload_folder_if_changed(
+                        local_folder=local_tile,
+                        repo_path=repo_tile,
+                        date_yyyymmdd=ymd,
+                        kind="tilecache",
+                        dom=dom,
+                        hours=int(h),
+                    )
+
+                    # rawtilecache
+                    local_raw = CACHE / "rawtilecache" / dom / str(int(h)) / ymd
+                    repo_raw = f"rawtilecache/{dom}/{int(h)}/{ymd}"
+                    _hf_upload_folder_if_changed(
+                        local_folder=local_raw,
+                        repo_path=repo_raw,
+                        date_yyyymmdd=ymd,
+                        kind="rawtilecache",
+                        dom=dom,
+                        hours=int(h),
+                    )
+
+            _log("INFO", "[uploader] sleep 30min")
+            time.sleep(30 * 60)
+
+        except Exception as e:
+            _log("WARN", f"[uploader] crashed err={e!r}")
+            time.sleep(60)
+       
+def _is_valid_npz_file(p: Path) -> bool:
+    try:
+        if not p.exists():
+            return False
+        st = p.stat()
+        if st.st_size < 60:
+            return False
+        with p.open("rb") as f:
+            head = f.read(2)
+        return head == b"PK"
+    except Exception:
+        return False
+        
 def _pack_raw_tile_npz(*, melt_mm: np.ndarray, valid_mask_u8: np.ndarray) -> bytes:
-    """
-    Packs melt values into uint16 "tenths of an inch" for compact client readout.
-
-    - melt_mm: float array (H,W) in millimeters
-    - valid_mask_u8: uint8 mask (H,W) where 0 invalid, 255 valid (same convention you use for PNG)
-    Output NPZ contains:
-      q: uint16  (tenths of inches; 0..65535)
-      m: uint8   (0/255 validity mask)
-      s: uint8   (scale factor: 10 => value_in = q / 10)
-    """
     try:
         mm = melt_mm.astype("float32", copy=False)
         m = valid_mask_u8.astype("uint8", copy=False)
@@ -220,7 +552,6 @@ def _pack_raw_tile_npz(*, melt_mm: np.ndarray, valid_mask_u8: np.ndarray) -> byt
 
         inches = (mm / 25.4).astype("float32", copy=False)
         q = np.zeros(inches.shape, dtype="uint16")
-        # Quantize to tenths of an inch
         qv = np.rint(np.clip(inches * 10.0, 0.0, 65535.0)).astype("uint16")
         q[valid] = qv[valid]
 
@@ -228,22 +559,38 @@ def _pack_raw_tile_npz(*, melt_mm: np.ndarray, valid_mask_u8: np.ndarray) -> byt
         np.savez_compressed(bio, q=q, m=m, s=np.uint8(10))
         return bio.getvalue()
     except Exception:
-        # Fallback: tiny valid NPZ so callers don't crash
         bio = io.BytesIO()
         np.savez_compressed(bio, q=np.zeros((256, 256), dtype="uint16"), m=np.zeros((256, 256), dtype="uint8"), s=np.uint8(10))
         return bio.getvalue()
 
 _LOCK_ROOT = Path(os.environ.get("SNODAS_LOCK_DIR", "/tmp/snodas-locks")).expanduser()
 _LOCK_ROOT.mkdir(parents=True, exist_ok=True)
+_LOCK_STALE_SECONDS = int(os.environ.get("LOCK_STALE_SECONDS", str(48 * 3600)))
 
-def _acquire_singleton_lock(name: str = "scheduler") -> bool:
-    lock_path = _LOCK_ROOT / f"{name}.lock"
+def _acquire_singleton_lock(name: str) -> bool:
+    p = _LOCK_ROOT / f"{name}.lock"
     fd = None
     try:
-        fd = os.open(lock_path.as_posix(), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        os.write(fd, str(os.getpid()).encode("utf-8"))
+        fd = os.open(p.as_posix(), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        payload = f"pid={os.getpid()} utc={datetime.utcnow().isoformat()}\n"
+        os.write(fd, payload.encode("utf-8"))
         return True
     except FileExistsError:
+        # Try stale recovery
+        try:
+            age = time.time() - p.stat().st_mtime
+            if age > float(_LOCK_STALE_SECONDS):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                # retry once
+                fd = os.open(p.as_posix(), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                payload = f"pid={os.getpid()} utc={datetime.utcnow().isoformat()} stale_recovered=1\n"
+                os.write(fd, payload.encode("utf-8"))
+                return True
+        except Exception:
+            pass
         return False
     except Exception:
         return False
@@ -254,21 +601,52 @@ def _acquire_singleton_lock(name: str = "scheduler") -> bool:
             except Exception:
                 pass
 
-def _pick_cache_root() -> Path:
-    env = (os.environ.get("SNODAS_CACHE") or "").strip()
-    candidates = ([env] if env else []) + ["/data/snodas-cache", "/home/user/snodas-cache", "/tmp/snodas-cache", "./cache"]
-    for c in candidates:
-        p = Path(c).expanduser()
+_ROLL_LOCK_NAME = "roll_job"
+_ROLL_LOCK_STALE_SECONDS = int(os.environ.get("ROLL_LOCK_STALE_SECONDS", str(16 * 3600)))  # 16 hours default
+
+def _run_lock_path(name: str) -> Path:
+    return _LOCK_ROOT / f"{name}.runlock"
+
+def _try_acquire_run_lock(name: str, *, stale_seconds: int) -> bool:
+    p = _run_lock_path(name)
+    fd = None
+    try:
+        fd = os.open(p.as_posix(), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        payload = f"pid={os.getpid()} utc={datetime.utcnow().isoformat()}\n"
+        os.write(fd, payload.encode("utf-8"))
+        return True
+    except FileExistsError:
         try:
-            p.mkdir(parents=True, exist_ok=True)
-            t = p / ".wtest"
-            t.write_text("ok")
-            t.unlink(missing_ok=True)
-            return p.resolve()
+            age = time.time() - p.stat().st_mtime
+            if age > float(stale_seconds):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                # retry once
+                fd = os.open(p.as_posix(), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                payload = f"pid={os.getpid()} utc={datetime.utcnow().isoformat()} stale_recovered=1\n"
+                os.write(fd, payload.encode("utf-8"))
+                return True
         except Exception:
             pass
-    return Path(tempfile.mkdtemp(prefix="snodas-cache-")).resolve()
-CACHE = _pick_cache_root()
+        return False
+    except Exception:
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+def _release_run_lock(name: str) -> None:
+    p = _run_lock_path(name)
+    try:
+        p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
 
 CFGRIB_DIR = CACHE / "cfgrib"
 CFGRIB_DIR.mkdir(parents=True, exist_ok=True)
@@ -333,24 +711,17 @@ def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> b
     Returns None if not found anywhere.
     """
     p = _tile_cache_path(dom, hours, ymd, z, x, y)
-
-    # FAST PATH: Check local cache first
     try:
         if _is_valid_png_file(p):
             return p.read_bytes()
         elif p.exists():
-            # Invalid/corrupted file, remove it
             _safe_unlink(p)
     except Exception:
         pass
-
-    # SLOW PATH: Try to pull from HF repo
     if not _hf_pull_on_miss_enabled():
         return None
 
     rel = p.relative_to(CACHE).as_posix()
-    
-    # Try to pull from HF (with timeout protection)
     try:
         if _hf_try_pull_file(rel):
             # Verify the pulled file
@@ -364,74 +735,153 @@ def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> b
             _log("WARN", f"[hf_pull] unexpected error for {rel}: {e!r}")
 
     return None
-
 def _incremental_hf_push(
     tile_paths: list[Path],
-    repo_prefix: str,  # "tilecache" or "rawtilecache"
-    batch_name: str,   # For commit message, e.g., "20260115_corridor_png"
+    repo_prefix: str,
+    batch_name: str,
 ) -> dict:
-    """Push a batch of tiles to HF immediately."""
+    if not tile_paths:
+        return {"ok": True, "pushed": 0, "skipped": 0}
+
+    # Do NOT commit tiles incrementally anymore; folder uploader handles them.
+    if repo_prefix in ("tilecache", "rawtilecache"):
+        return {"ok": True, "pushed": 0, "skipped": len(tile_paths), "disabled": True}
+
     tok, repo = _hf_cfg()
     api = _hf_api()
     if not tok or not repo or api is None:
-        return {"ok": False, "error": "hf_not_configured", "count": 0}
-    
-    if not tile_paths:
-        return {"ok": True, "pushed": 0, "skipped": 0}
-    
-    ops = []
+        return {"ok": False, "error": "hf_not_configured", "pushed": 0, "skipped": 0}
+
+    ops: list[CommitOperationAdd] = []
+    skipped = 0
+
     for p in tile_paths:
-        if p.exists() and p.stat().st_size > 0:
-            rel = f"{repo_prefix}/{p.name}"
+        try:
+            if (not p.exists()) or (p.stat().st_size <= 0):
+                skipped += 1
+                continue
+            rel = p.relative_to(CACHE).as_posix()
+            if not (rel.startswith("forecast/") or rel.startswith("tracks/")):
+                skipped += 1
+                continue
             ops.append(CommitOperationAdd(path_in_repo=rel, path_or_fileobj=p.as_posix()))
-    
+        except Exception:
+            skipped += 1
+
     if not ops:
         return {"ok": True, "pushed": 0, "skipped": len(tile_paths)}
-    
-    try:
-        api.create_commit(
-            repo_id=repo,
-            repo_type="dataset",
-            token=tok,
-            operations=ops,
-            commit_message=f"{repo_prefix}: {batch_name} ({len(ops)} files)",
-        )
-        return {"ok": True, "pushed": len(ops), "skipped": len(tile_paths) - len(ops)}
-    except Exception as e:
-        _log("WARN", f"[incremental_push] failed: {e!r}")
-        return {"ok": False, "error": repr(e), "count": len(ops)}
 
+    dedup: dict[str, CommitOperationAdd] = {}
+    for op in ops:
+        dedup[op.path_in_repo] = op
+    ops = list(dedup.values())
 
-def _raw_tile_cache_put(dom: str, hours: int, ymd: str, z: int, x: int, y: int, raw: bytes) -> None:
-    """
-    Store raw tile data (NPZ format) to local cache.
-    This is the counterpart to _raw_tile_cache_get.
-    """
-    p = _raw_tile_cache_path(dom, hours, ymd, z, x, y)
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_bytes(raw)
-        tmp.replace(p)
-    except Exception:
-        pass
+    attempts = 3
+    last_err: str | None = None
+    for i in range(attempts):
+        try:
+            api.create_commit(
+                repo_id=repo,
+                repo_type="dataset",
+                token=tok,
+                operations=ops,
+                commit_message=f"{repo_prefix}: {batch_name} ({len(ops)} files)",
+            )
+            return {"ok": True, "pushed": len(ops), "skipped": (len(tile_paths) - len(ops)) + skipped}
+        except Exception as e:
+            msg = repr(e)
+            last_err = msg
+            is_timeout = ("ReadTimeout" in msg) or ("Timeout" in msg) or ("timed out" in msg.lower())
+            _log("WARN", f"[incremental_push] failed attempt={i+1}/{attempts}: {msg}")
+            if not is_timeout:
+                return {"ok": False, "error": msg, "pushed": 0, "skipped": 0}
+            time.sleep(2.0 * (2 ** i) + random.random())
 
-def _tile_cache_put(dom: str, hours: int, ymd: str, z: int, x: int, y: int, png: bytes) -> None:
-    # Optional: don't cache empty/transparent tiles
-    try:
-        if png == _transparent_png_256():
-            return
-    except Exception:
-        pass
+    return {"ok": False, "error": last_err or "unknown_error", "pushed": 0, "skipped": 0}
 
-    p = _tile_cache_path(dom, hours, ymd, z, x, y)
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_bytes(png)
-        tmp.replace(p)
-    except Exception:
-        pass
+# def _incremental_hf_push(
+#     tile_paths: list[Path],
+#     repo_prefix: str,
+#     batch_name: str,
+# ) -> dict:
+#     tok, repo = _hf_cfg()
+#     api = _hf_api()
+#     if not tok or not repo or api is None:
+#         return {"ok": False, "error": "hf_not_configured", "pushed": 0, "skipped": 0}
+
+#     if not tile_paths:
+#         return {"ok": True, "pushed": 0, "skipped": 0}
+
+#     ops: list[CommitOperationAdd] = []
+#     skipped = 0
+
+#     # Use nested repo paths (tilecache/dom/hours/ymd/z/x/y.png, rawtilecache/...)
+#     # This avoids HF's 10,000-files-per-directory limit.
+#     for p in tile_paths:
+#         try:
+#             if (not p.exists()) or (p.stat().st_size <= 0):
+#                 skipped += 1
+#                 continue
+
+#             rel = p.relative_to(CACHE).as_posix()
+#             if not (rel.startswith("tilecache/") or rel.startswith("rawtilecache/") or rel.startswith("forecast/") or rel.startswith("tracks/")):
+#                 # Safety: don't push unexpected paths
+#                 skipped += 1
+#                 continue
+
+#             ops.append(CommitOperationAdd(path_in_repo=rel, path_or_fileobj=p.as_posix()))
+#         except Exception:
+#             skipped += 1
+
+#     if not ops:
+#         return {"ok": True, "pushed": 0, "skipped": len(tile_paths)}
+
+#     # De-dupe by path_in_repo (last wins)
+#     dedup: dict[str, CommitOperationAdd] = {}
+#     for op in ops:
+#         dedup[op.path_in_repo] = op
+#     ops = list(dedup.values())
+
+#     attempts = 3
+#     last_err: str | None = None
+#     for i in range(attempts):
+#         try:
+#             api.create_commit(
+#                 repo_id=repo,
+#                 repo_type="dataset",
+#                 token=tok,
+#                 operations=ops,
+#                 commit_message=f"{repo_prefix}: {batch_name} ({len(ops)} files)",
+#             )
+#             return {"ok": True, "pushed": len(ops), "skipped": (len(tile_paths) - (len(ops))) + skipped}
+#         except Exception as e:
+#             msg = repr(e)
+#             last_err = msg
+
+#             # HF sometimes returns timeouts even if the server completed; retry is safe because ops are idempotent.
+#             is_timeout = ("ReadTimeout" in msg) or ("Timeout" in msg) or ("timed out" in msg.lower())
+#             too_many_files = ("too many files per directory" in msg.lower())
+
+#             _log("WARN", f"[incremental_push] failed attempt={i+1}/{attempts}: {msg}")
+
+#             if too_many_files:
+#                 # This should not happen with nested paths; if it does, it means rel paths collapsed to /tilecache/
+#                 return {
+#                     "ok": False,
+#                     "error": "hf_too_many_files_per_directory",
+#                     "detail": msg,
+#                     "pushed": 0,
+#                     "skipped": 0,
+#                 }
+
+#             if not is_timeout:
+#                 return {"ok": False, "error": msg, "pushed": 0, "skipped": 0}
+
+#             # Backoff for transient issues
+#             time.sleep(2.0 * (2 ** i) + random.random())
+
+#     return {"ok": False, "error": last_err or "unknown_error", "pushed": 0, "skipped": 0}
+
 
 CN_MBTILES_LOCAL = Path("cache") / "tracks" / "cn_tracks.mbtiles"
 CN_MBTILES_REPO_PATH = "tracks/cn_tracks.mbtiles"
@@ -466,7 +916,62 @@ def _ensure_cn_mbtiles() -> Path:
 
     return CN_MBTILES_LOCAL
 
+def _mbtiles_overzoom(z: int, x: int, y: int, zmax: int) -> tuple[int, int, int]:
+    z = int(z); x = int(x); y = int(y); zmax = int(zmax)
+    if z <= zmax:
+        return z, x, y
+    dz = z - zmax
+    return zmax, (x >> dz), (y >> dz)
 
+def _cogreader_lru_invalidate(cog: Path) -> None:
+    key = cog.as_posix()
+    with _COG_LRU_LK:
+        r = _COG_LRU.pop(key, None)
+    if r is not None:
+        try:
+            r.close()
+        except Exception:
+            pass
+
+
+def _atomic_replace(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        src.replace(dst)  # atomic on same filesystem
+    except Exception:
+        if dst.exists():
+            try:
+                dst.unlink(missing_ok=True)
+            except Exception:
+                pass
+        src.replace(dst)
+
+
+def _atomic_cog_translate(src_tif: Path, out_cog: Path) -> None:
+    out_cog.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_cog = out_cog.with_suffix(out_cog.suffix + ".tmp")
+    try:
+        tmp_cog.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    prof = cog_profiles.get("deflate")
+    if prof is None:
+        raise HTTPException(status_code=500, detail="rio_cogeo deflate profile missing")
+
+    cog_translate(
+        src_tif.as_posix(),
+        tmp_cog.as_posix(),
+        prof,
+        in_memory=False,
+        quiet=True,
+    )
+
+    # invalidate any cached readers before swapping file
+    _cogreader_lru_invalidate(out_cog)
+
+    _atomic_replace(tmp_cog, out_cog)
 
 def _mbtiles_xyz_to_tms(z: int, y: int) -> int:
     return (1 << int(z)) - 1 - int(y)
@@ -505,23 +1010,22 @@ def _cn_mbtiles_maxzoom() -> int:
     except Exception:
         pass
 
-    return 12
+    return 7
+
+def _cn_overzoom_parent(z: int, x: int, y: int, maxz: int) -> tuple[int, int, int]:
+    z = int(z); x = int(x); y = int(y); maxz = int(maxz)
+    if z <= maxz:
+        return z, x, y
+    dz = z - maxz
+    # Parent tile at maxz
+    return maxz, (x >> dz), (y >> dz)
+
+
 def _tiles_for_boxes_zoom_range(
     boxes: list[tuple[float, float, float, float]],
     zmin: int,
     zmax: int,
 ) -> list[tuple[int, int, int]]:
-    """
-    Generate a list of tiles (z, x, y) for the given bounding boxes across zoom levels.
-    
-    Args:
-        boxes: List of (west, south, east, north) tuples
-        zmin: Minimum zoom level
-        zmax: Maximum zoom level
-    
-    Returns:
-        List of (z, x, y) tile coordinates
-    """
     def lon2tile(lon: float, z: int) -> int:
         return int(np.floor(((lon + 180.0) / 360.0) * (1 << int(z))))
 
@@ -540,8 +1044,8 @@ def _tiles_for_boxes_zoom_range(
         for (w, s, e, nlat) in boxes:
             x0 = max(0, min(n, lon2tile(w, z)))
             x1 = max(0, min(n, lon2tile(e, z)))
-            y0 = max(0, min(n, lat2tile(nlat, z)))  # north -> smaller y
-            y1 = max(0, min(n, lat2tile(s, z)))     # south -> larger y
+            y0 = max(0, min(n, lat2tile(nlat, z)))
+            y1 = max(0, min(n, lat2tile(s, z)))
 
             xmin, xmax = (x0, x1) if x0 <= x1 else (x1, x0)
             ymin, ymax = (y0, y1) if y0 <= y1 else (y1, y0)
@@ -639,7 +1143,6 @@ def _generate_forecast_by_date_png_impl(
     dom: str,
     max_in: float | None,
 ) -> tuple[bytes, dict]:
-    """Generate forecast tile PNG. Builds COGs on-demand if needed."""
     dom = (dom or "zz").lower()
     valid = _norm_ts(f"{date_yyyymmdd}05")
 
@@ -651,45 +1154,69 @@ def _generate_forecast_by_date_png_impl(
             detail["suggestion"] = "forecast data may not be available yet for this date"
             raise HTTPException(status_code=503, detail=detail)
 
-        # Build melt + snow COGs (this will build on-demand if missing)
         try:
-            melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
-        except HTTPException as e:
-            # If melt COGs can't be built, surface a clearer error
+            melt24_union = _forecast_melt24h_union_end_cog(sel["valid"], dom_prefer=dom)
+        except Exception as e:
             raise HTTPException(
-                status_code=503, 
+                status_code=503,
                 detail={
-                    "error": "melt_cogs_unavailable",
+                    "error": "melt24_union_cog_unavailable",
                     "date": date_yyyymmdd,
                     "hours": 24,
-                    "upstream_error": str(e.detail) if hasattr(e, 'detail') else str(e)
-                }
+                    "upstream_error": repr(e),
+                },
             )
 
-        snow = snow_valid = None
-        snow_info = "snowpack_unavailable"
-        if sel.get("snowpack_urls"):
-            try:
-                snow_cogs = _build_forecast_snowpack_cogs(sel.get("snowpack_ts") or sel["valid"], sel["snowpack_urls"])
-                snow, snow_valid, snow_info = _union_tile(snow_cogs, z, x, y, label="snowpack")
-            except Exception as e:
-                snow_info = f"snowpack_unavailable:{e!r}"
-
-        melt_mm, melt_valid, melt_info = _union_tile(melt_cogs, z, x, y, label="melt")
-        if melt_mm is None or melt_valid is None:
+        try:
+            melt_mm, melt_mask, oob = _tile_arrays_from_cog(melt24_union, z, x, y, cog_cache=COG_CACHE)
+        except Exception as e:
+            _log("WARN", f"[tile_read] melt24 failed date={date_yyyymmdd} dom={dom} z={z} x={x} y={y} err={e!r}")
             return _transparent_png_256(), {
                 "X-Allowed": "1",
                 "X-OOB": "1",
-                "X-Melt-Info": melt_info,
-                "X-SnowMask-Info": snow_info,
+                "X-Melt-Info": f"melt24_union:{melt24_union.name}",
+                "X-SnowMask-Info": "snowpack_unavailable",
+                "X-Forecast-Valid": sel["valid"],
+                "X-Forecast-RunInit-TT": sel["run_init"],
+                "X-Forecast-Hours": "24",
+                "X-Read-Error": "melt24",
+            }
+
+        if oob or melt_mm is None or melt_mask is None:
+            return _transparent_png_256(), {
+                "X-Allowed": "1",
+                "X-OOB": "1",
+                "X-Melt-Info": f"melt24_union:{melt24_union.name}",
+                "X-SnowMask-Info": "snowpack_unavailable",
                 "X-Forecast-Valid": sel["valid"],
                 "X-Forecast-RunInit-TT": sel["run_init"],
                 "X-Forecast-Hours": "24",
             }
 
+        melt_valid = (melt_mask > 0) & np.isfinite(melt_mm) & (melt_mm > -9990.0)
+        melt_mask_u8 = (melt_valid.astype("uint8") * 255)
+
+        snow = snow_valid = None
+        snow_info = "snowpack_unavailable"
+        if sel.get("snowpack_urls"):
+            try:
+                snow_union = _forecast_snowpack_union_end_cog(sel.get("snowpack_ts") or sel["valid"], dom_prefer=dom)
+                if snow_union:
+                    try:
+                        snow_arr, snow_mask, oob2 = _tile_arrays_from_cog(snow_union, z, x, y, cog_cache=COG_CACHE)
+                        if (not oob2) and (snow_arr is not None) and (snow_mask is not None):
+                            snow_valid = (snow_mask > 0) & np.isfinite(snow_arr) & (snow_arr > -9990.0)
+                            snow = snow_arr
+                            snow_info = f"snowpack_union:{snow_union.name}"
+                    except Exception as e2:
+                        _log("WARN", f"[tile_read] snowpack24 failed date={date_yyyymmdd} dom={dom} z={z} x={x} y={y} err={e2!r}")
+                        snow_info = f"snowpack_unavailable:{e2!r}"
+            except Exception as e:
+                snow_info = f"snowpack_unavailable:{e!r}"
+
         png = _melt_to_png(
             melt_mm,
-            (melt_valid.astype("uint8") * 255),
+            melt_mask_u8,
             max_in,
             snow,
             snow_valid,
@@ -702,7 +1229,7 @@ def _generate_forecast_by_date_png_impl(
         return png, {
             "X-Allowed": "1",
             "X-OOB": "0",
-            "X-Melt-Info": melt_info,
+            "X-Melt-Info": f"melt24_union:{melt24_union.name}",
             "X-SnowMask-Info": snow_info,
             "X-Forecast-Valid": sel["valid"],
             "X-Forecast-RunInit-TT": sel["run_init"],
@@ -713,13 +1240,13 @@ def _generate_forecast_by_date_png_impl(
     run_init = _pick_best_run_init_for_valid_t0024(valid, dom_prefer=dom)
     if not run_init:
         raise HTTPException(
-            status_code=503, 
+            status_code=503,
             detail={
-                "error": "no_run_init_for_valid", 
-                "valid": valid, 
+                "error": "no_run_init_for_valid",
+                "valid": valid,
                 "dom": dom,
-                "suggestion": "forecast data may not be available yet for this date"
-            }
+                "suggestion": "forecast data may not be available yet for this date",
+            },
         )
 
     try:
@@ -731,11 +1258,24 @@ def _generate_forecast_by_date_png_impl(
                 "error": "melt72_cog_unavailable",
                 "date": date_yyyymmdd,
                 "hours": 72,
-                "upstream_error": str(e.detail) if hasattr(e, 'detail') else str(e)
-            }
+                "upstream_error": str(e.detail) if hasattr(e, "detail") else str(e),
+            },
         )
 
-    melt_mm, melt_mask, oob = _tile_arrays_from_cog(melt72_cog, z, x, y)
+    try:
+        melt_mm, melt_mask, oob = _tile_arrays_from_cog(melt72_cog, z, x, y, cog_cache=COG_CACHE)
+    except Exception as e:
+        _log("WARN", f"[tile_read] melt72 failed date={date_yyyymmdd} dom={dom} z={z} x={x} y={y} err={e!r}")
+        return _transparent_png_256(), {
+            "X-Allowed": "1",
+            "X-OOB": "1",
+            "X-Forecast-Hours": "72",
+            "X-Forecast-Valid": valid,
+            "X-Forecast-RunInit-TT": run_init,
+            "X-Forecast-72h-COG": melt72_cog.name,
+            "X-Read-Error": "melt72",
+        }
+
     if oob or melt_mm is None or melt_mask is None:
         return _transparent_png_256(), {
             "X-Allowed": "1",
@@ -777,6 +1317,8 @@ def _generate_forecast_by_date_png_impl(
         "X-Forecast-72h-COG": melt72_cog.name,
         "X-SnowPack-INFO": snow_info,
     }
+
+
 def _forecast_melt24h_union_cog(valid: str, dom_prefer: str = "zz") -> Path:
     dom_prefer = (dom_prefer or "zz").lower()
     valid = _norm_ts(valid)
@@ -791,18 +1333,12 @@ def _forecast_melt24h_union_cog(valid: str, dom_prefer: str = "zz") -> Path:
     melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
     if not melt_cogs:
         raise HTTPException(status_code=503, detail={"error": "no_melt_cogs", "valid": valid, "dom": dom_prefer})
-
-    # sort by your domain priority (same as _union_tile iteration order)
     cogs = sorted(melt_cogs, key=lambda p: _dom_pri(_cog_dom(p)))
-
-    # union semantics: keep first valid pixel; fill gaps from next
     with rasterio.open(cogs[0]) as base:
         acc = base.read(1).astype("float32")
         base_transform = base.transform
         base_crs = base.crs
         base_w, base_h = base.width, base.height
-
-        # validity mask like _union_tile: finite and > -9990
         acc_valid = np.isfinite(acc) & (acc > -9990.0)
 
         for p in cogs[1:]:
@@ -834,7 +1370,9 @@ def _forecast_melt24h_union_cog(valid: str, dom_prefer: str = "zz") -> Path:
         with rasterio.open(tmp_tif, "w", **prof) as ds:
             ds.write(acc, 1)
 
-    cog_translate(tmp_tif.as_posix(), out.as_posix(), cog_profiles.get("deflate"), in_memory=False, quiet=True)
+    # cog_translate(tmp_tif.as_posix(), out.as_posix(), cog_profiles.get("deflate"), in_memory=False, quiet=True)
+    _atomic_cog_translate(tmp_tif, out)
+
     try:
         _hf_enqueue_files([out])
     except Exception:
@@ -844,6 +1382,161 @@ def _forecast_melt24h_union_cog(valid: str, dom_prefer: str = "zz") -> Path:
     _log("INFO", f"[build_forecast] melt24_union OK valid={valid} dom_prefer={dom_prefer} -> {out.name}")
     return out
 
+def _forecast_melt24h_union_end_cog(valid: str, dom_prefer: str = "zz") -> Path:
+    valid = _norm_ts(valid)
+    dom_prefer = (dom_prefer or "zz").lower()
+    out = _forecast_dir() / f"fcst_melt24h_union_end_{valid}_{dom_prefer}_cog.tif"
+    if out.exists() and out.stat().st_size > 0:
+        return out
+
+    _hf_try_pull_file(out.relative_to(CACHE).as_posix())
+    if out.exists() and out.stat().st_size > 0:
+        return out
+
+    with _lock(f"fcst_melt24h_union_{valid}_{dom_prefer}"):
+        if out.exists() and out.stat().st_size > 0:
+            return out
+
+        sel = _pick_forecast_for_valid(valid, dom_prefer=dom_prefer)
+        if not sel.get("ok"):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "forecast_selection_unavailable_for_24h_union",
+                    "valid": valid,
+                    "dom": dom_prefer,
+                    "sel": sel,
+                },
+            )
+
+        melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+        if not melt_cogs:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "no_melt_cogs_for_24h_union", "valid": valid, "dom": dom_prefer},
+            )
+
+        cogs = sorted(melt_cogs, key=lambda p: _dom_pri(_cog_dom(p)))
+
+        with rasterio.open(cogs[0]) as base:
+            acc = base.read(1).astype("float32")
+            acc_valid = np.isfinite(acc) & (acc > -9990.0)
+
+            for c in cogs[1:]:
+                with rasterio.open(c) as src:
+                    arr = src.read(1).astype("float32")
+                    if (src.transform != base.transform) or (src.crs != base.crs) or (src.width != base.width) or (src.height != base.height):
+                        tmp = np.full_like(acc, np.nan, dtype="float32")
+                        reproject(
+                            arr,
+                            tmp,
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=base.transform,
+                            dst_crs=base.crs,
+                            resampling=Resampling.nearest,
+                        )
+                        arr = tmp
+
+                    v = np.isfinite(arr) & (arr > -9990.0)
+                    fill = v & (~acc_valid)
+                    if fill.any():
+                        acc[fill] = arr[fill]
+                        acc_valid[fill] = True
+
+            tmp_tif = out.with_suffix(".tmp.tif")
+            prof = base.profile.copy()
+            prof.update({"compress": "DEFLATE", "tiled": True})
+            with rasterio.open(tmp_tif, "w", **prof) as ds:
+                ds.write(acc, 1)
+
+        # cog_translate(tmp_tif.as_posix(), out.as_posix(), cog_profiles.get("deflate"), in_memory=False, quiet=True)
+        _atomic_cog_translate(tmp_tif, out)
+
+        try:
+            _hf_enqueue_files([out])
+        except Exception:
+            pass
+
+        tmp_tif.unlink(missing_ok=True)
+
+        _log("INFO", f"[build_forecast] melt24h_union OK valid={valid} dom_prefer={dom_prefer} -> {out.name} (from {', '.join([p.name for p in cogs[:4]])}{'...' if len(cogs) > 4 else ''})")
+        return out
+
+
+def _forecast_snowpack_union_end_cog(valid: str, dom_prefer: str = "zz") -> Path | None:
+    valid = _norm_ts(valid)
+    dom_prefer = (dom_prefer or "zz").lower()
+    out = _forecast_dir() / f"fcst_snowpack_union_end_{valid}_{dom_prefer}_cog.tif"
+    if out.exists() and out.stat().st_size > 0:
+        return out
+
+    _hf_try_pull_file(out.relative_to(CACHE).as_posix())
+    if out.exists() and out.stat().st_size > 0:
+        return out
+
+    with _lock(f"fcst_snowpack_union_{valid}_{dom_prefer}"):
+        if out.exists() and out.stat().st_size > 0:
+            return out
+
+        sel = _pick_forecast_for_valid(valid, dom_prefer=dom_prefer)
+        if not sel.get("ok") or not sel.get("snowpack_urls"):
+            return None
+
+        try:
+            snow_cogs = _build_forecast_snowpack_cogs(sel.get("snowpack_ts") or sel["valid"], sel["snowpack_urls"])
+        except Exception:
+            return None
+
+        if not snow_cogs:
+            return None
+
+        cogs = sorted(snow_cogs, key=lambda p: _dom_pri(_cog_dom(p)))
+
+        with rasterio.open(cogs[0]) as base:
+            acc = base.read(1).astype("float32")
+            acc_valid = np.isfinite(acc) & (acc > -9990.0)
+
+            for c in cogs[1:]:
+                with rasterio.open(c) as src:
+                    arr = src.read(1).astype("float32")
+                    if (src.transform != base.transform) or (src.crs != base.crs) or (src.width != base.width) or (src.height != base.height):
+                        tmp = np.full_like(acc, np.nan, dtype="float32")
+                        reproject(
+                            arr,
+                            tmp,
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=base.transform,
+                            dst_crs=base.crs,
+                            resampling=Resampling.nearest,
+                        )
+                        arr = tmp
+
+                    v = np.isfinite(arr) & (arr > -9990.0)
+                    fill = v & (~acc_valid)
+                    if fill.any():
+                        acc[fill] = arr[fill]
+                        acc_valid[fill] = True
+
+            tmp_tif = out.with_suffix(".tmp.tif")
+            prof = base.profile.copy()
+            prof.update({"compress": "DEFLATE", "tiled": True})
+            with rasterio.open(tmp_tif, "w", **prof) as ds:
+                ds.write(acc, 1)
+
+        # cog_translate(tmp_tif.as_posix(), out.as_posix(), cog_profiles.get("deflate"), in_memory=False, quiet=True)
+        _atomic_cog_translate(tmp_tif, out)
+
+        try:
+            _hf_enqueue_files([out])
+        except Exception:
+            pass
+
+        tmp_tif.unlink(missing_ok=True)
+
+        _log("INFO", f"[build_forecast] snowpack_union OK valid={valid} dom_prefer={dom_prefer} -> {out.name} (from {', '.join([p.name for p in cogs[:4]])}{'...' if len(cogs) > 4 else ''})")
+        return out
 
 def _forecast_snowpack_union_cog(valid: str, dom_prefer: str = "zz") -> Path | None:
     dom_prefer = (dom_prefer or "zz").lower()
@@ -902,7 +1595,9 @@ def _forecast_snowpack_union_cog(valid: str, dom_prefer: str = "zz") -> Path | N
         with rasterio.open(tmp_tif, "w", **prof) as ds:
             ds.write(acc, 1)
 
-    cog_translate(tmp_tif.as_posix(), out.as_posix(), cog_profiles.get("deflate"), in_memory=False, quiet=True)
+    # cog_translate(tmp_tif.as_posix(), out.as_posix(), cog_profiles.get("deflate"), in_memory=False, quiet=True)
+    _atomic_cog_translate(tmp_tif, out)
+
     try:
         _hf_enqueue_files([out])
     except Exception:
@@ -938,6 +1633,7 @@ def _generate_forecast_by_date_raw_impl(
     date_yyyymmdd: str,
     hours: int,
     dom: str,
+    cog_cache: CogCache | None = None,
 ) -> tuple[bytes, dict]:
     dom = (dom or "zz").lower()
     valid = _norm_ts(f"{date_yyyymmdd}05")
@@ -950,19 +1646,13 @@ def _generate_forecast_by_date_raw_impl(
             detail["suggestion"] = "forecast data may not be available yet for this date"
             raise HTTPException(status_code=503, detail=detail)
 
-        melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+        melt24_union = _forecast_melt24h_union_end_cog(sel["valid"], dom_prefer=dom)
 
-        snow = snow_valid = None
-        snow_info = "snowpack_unavailable"
-        if sel.get("snowpack_urls"):
-            try:
-                snow_cogs = _build_forecast_snowpack_cogs(sel.get("snowpack_ts") or sel["valid"], sel["snowpack_urls"])
-                snow, snow_valid, snow_info = _union_tile(snow_cogs, z, x, y, label="snowpack")
-            except Exception as e:
-                snow_info = f"snowpack_unavailable:{e!r}"
+        melt_mm, melt_mask, oob = _tile_arrays_from_cog(
+            melt24_union, z, x, y, cog_cache=cog_cache
+        )
 
-        melt_mm, melt_valid, melt_info = _union_tile(melt_cogs, z, x, y, label="melt")
-        if melt_mm is None or melt_valid is None:
+        if oob or melt_mm is None or melt_mask is None:
             raw = _pack_raw_tile_npz(
                 melt_mm=np.zeros((256, 256), dtype="float32"),
                 valid_mask_u8=np.zeros((256, 256), dtype="uint8"),
@@ -970,23 +1660,35 @@ def _generate_forecast_by_date_raw_impl(
             return raw, {
                 "X-Allowed": "1",
                 "X-OOB": "1",
-                "X-Melt-Info": melt_info,
-                "X-SnowMask-Info": snow_info,
+                "X-Melt-Info": f"melt24_union:{melt24_union.name}",
+                "X-SnowMask-Info": "snowpack_unavailable",
                 "X-Forecast-Valid": sel["valid"],
                 "X-Forecast-RunInit-TT": sel["run_init"],
                 "X-Forecast-Hours": "24",
                 "X-Raw-Scale": "10",
             }
 
+        melt_valid = (melt_mask > 0) & np.isfinite(melt_mm) & (melt_mm > -9990.0)
+        melt_mask_u8 = (melt_valid.astype("uint8") * 255)
+
+        snow_info = "snowpack_unavailable"
+        if sel.get("snowpack_urls"):
+            try:
+                snow_union = _forecast_snowpack_union_end_cog(sel.get("snowpack_ts") or sel["valid"], dom_prefer=dom)
+                if snow_union:
+                    snow_info = f"snowpack_union:{snow_union.name}"
+            except Exception as e:
+                snow_info = f"snowpack_unavailable:{e!r}"
+
         raw = _pack_raw_tile_npz(
             melt_mm=melt_mm,
-            valid_mask_u8=(melt_valid.astype("uint8") * 255),
+            valid_mask_u8=melt_mask_u8,
         )
 
         return raw, {
             "X-Allowed": "1",
             "X-OOB": "0",
-            "X-Melt-Info": melt_info,
+            "X-Melt-Info": f"melt24_union:{melt24_union.name}",
             "X-SnowMask-Info": snow_info,
             "X-Forecast-Valid": sel["valid"],
             "X-Forecast-RunInit-TT": sel["run_init"],
@@ -994,7 +1696,6 @@ def _generate_forecast_by_date_raw_impl(
             "X-Raw-Scale": "10",
         }
 
-    # 72h path
     run_init = _pick_best_run_init_for_valid_t0024(valid, dom_prefer=dom)
     if not run_init:
         raise HTTPException(
@@ -1008,7 +1709,11 @@ def _generate_forecast_by_date_raw_impl(
         )
 
     melt72_cog = _forecast_melt72h_end_cog(valid, dom_prefer=dom)
-    melt_mm, melt_mask, oob = _tile_arrays_from_cog(melt72_cog, z, x, y)
+
+    melt_mm, melt_mask, oob = _tile_arrays_from_cog(
+        melt72_cog, z, x, y, cog_cache=cog_cache
+    )
+
     if oob or melt_mm is None or melt_mask is None:
         raw = _pack_raw_tile_npz(
             melt_mm=np.zeros((256, 256), dtype="float32"),
@@ -1043,8 +1748,6 @@ def _generate_forecast_by_date_raw_impl(
 def _log(level: str, msg: str) -> None:
     _LOG.append({"ts": int(datetime.utcnow().timestamp() * 1000), "level": level, "msg": msg})
     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | {level} | {msg}", flush=True)
-
-
 
 _MODE = threading.local()
 def _mode_get(): return getattr(_MODE, "m", "tiles")
@@ -1106,12 +1809,7 @@ def _cpu_set_limits(*, tiles: int | None = None, value: int | None = None) -> No
         CPU_SEM_TILES = threading.BoundedSemaphore(t)
         CPU_SEM_VALUE = threading.BoundedSemaphore(v)
 
-# NEW - Safe no-op that doesn't replace semaphores:
 class _CpuLimits:
-    """
-    DEPRECATED: Now a no-op. The old version caused deadlocks by replacing 
-    semaphores while threads were waiting on them.
-    """
     def __init__(self, *, tiles: int | None = None, value: int | None = None):
         pass
     def __enter__(self):
@@ -1201,7 +1899,7 @@ def _tile_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
     east = _tile2lon(x + 1, z)
     north = _tile2lat(y, z)
     south = _tile2lat(y + 1, z)
-    return west, south, east, north  # (w,s,e,n)
+    return west, south, east, north
 
 def _box_intersects(a, b) -> bool:
     aw, as_, ae, an = a
@@ -1238,11 +1936,18 @@ def _hf_cfg() -> tuple[Optional[str], Optional[str]]:
         return None, None
     return tok, repo
 
+
+_HF_API_SINGLETON: Optional[HfApi] = None
+
 def _hf_api() -> Optional[HfApi]:
+    global _HF_API_SINGLETON
     tok, repo = _hf_cfg()
     if not tok or not repo:
         return None
-    return HfApi(token=tok)
+    if _HF_API_SINGLETON is None:
+        _HF_API_SINGLETON = HfApi()
+    return _HF_API_SINGLETON
+
 
 def _date_ymd_utc(d: datetime.date | None = None) -> str:
     if d is None:
@@ -1261,13 +1966,12 @@ def _is_cache_file_we_manage(rel: str) -> bool:
     n = rel.replace("\\", "/")
     if n.startswith("forecast/") and n.endswith("_cog.tif"):
         return True
-    if (n.startswith("melt24h_") or n.startswith("melt72h_end_")) and n.endswith("_cog.tif"):
-        return True
     if n.startswith("tilecache/") and n.endswith(".png"):
         return True
     if n.startswith("rawtilecache/") and n.endswith(".npz"):
         return True
     return False
+
 
 def _local_cache_paths_to_consider() -> list[Path]:
     out: list[Path] = []
@@ -1492,21 +2196,49 @@ def _hf_prune_remote_and_local(keep_days: int = _REMOTE_KEEP_DAYS) -> None:
     api = _hf_api()
     tok, repo = _hf_cfg()
 
-    local_del: list[Path] = []
-    for p in _local_cache_paths_to_consider():
-        ymd = _file_ymd_from_name(p.name)
-        if ymd and ymd < cutoff:
-            local_del.append(p)
+    local_deleted = 0
 
-    for p in local_del:
-        try:
-            p.unlink(missing_ok=True)
-        except Exception:
-            pass
+    try:
+        root = _tile_cache_dir()
+        if root.exists():
+            for dom_dir in root.iterdir():
+                if not dom_dir.is_dir():
+                    continue
+                for hours_dir in dom_dir.iterdir():
+                    if not hours_dir.is_dir():
+                        continue
+                    for ymd_dir in hours_dir.iterdir():
+                        if not ymd_dir.is_dir():
+                            continue
+                        ymd = ymd_dir.name
+                        if re.fullmatch(r"[0-9]{8}", ymd) and ymd < cutoff:
+                            shutil.rmtree(ymd_dir, ignore_errors=True)
+                            local_deleted += 1
+    except Exception:
+        pass
+
+    try:
+        root = _raw_tile_cache_dir()
+        if root.exists():
+            for dom_dir in root.iterdir():
+                if not dom_dir.is_dir():
+                    continue
+                for hours_dir in dom_dir.iterdir():
+                    if not hours_dir.is_dir():
+                        continue
+                    for ymd_dir in hours_dir.iterdir():
+                        if not ymd_dir.is_dir():
+                            continue
+                        ymd = ymd_dir.name
+                        if re.fullmatch(r"[0-9]{8}", ymd) and ymd < cutoff:
+                            shutil.rmtree(ymd_dir, ignore_errors=True)
+                            local_deleted += 1
+    except Exception:
+        pass
 
     if api is None or not repo:
-        if local_del:
-            _log("INFO", f"[hf_cache] local prune OK deleted={len(local_del)} cutoff={cutoff}")
+        if local_deleted:
+            _log("INFO", f"[hf_cache] local prune OK deleted_dirs={local_deleted} cutoff={cutoff}")
         return
 
     try:
@@ -1515,25 +2247,32 @@ def _hf_prune_remote_and_local(keep_days: int = _REMOTE_KEEP_DAYS) -> None:
         _log("INFO", f"[hf_cache] remote prune list FAIL err={e!r}")
         return
 
-    ops = []
+    ops: list = []
     for item in tree:
         try:
             if getattr(item, "type", "") != "file":
                 continue
             rel = getattr(item, "path", "")
-            if not rel or not _is_cache_file_we_manage(rel):
+            if not rel:
                 continue
-            ymd = _file_ymd_from_name(Path(rel).name)
+            if not _is_cache_file_we_manage(rel):
+                continue
+            ymd = _ymd_from_cache_relpath(rel)
             if ymd and ymd < cutoff:
                 ops.append(CommitOperationDelete(path_in_repo=rel))
         except Exception:
             continue
 
+    if not ops:
+        _log("INFO", f"[hf_cache] prune OK local_deleted_dirs={local_deleted} remote_deleted=0 cutoff={cutoff}")
+        return
+
     try:
         _hf_commit(ops, message=f"cache: prune < {cutoff}")
-        _log("INFO", f"[hf_cache] prune OK local_deleted={len(local_del)} remote_deleted={len(ops)} cutoff={cutoff}")
+        _log("INFO", f"[hf_cache] prune OK local_deleted_dirs={local_deleted} remote_deleted={len(ops)} cutoff={cutoff}")
     except Exception as e:
         _log("INFO", f"[hf_cache] remote prune FAIL err={e!r}")
+
 
 def _ts_to_dt(ts10: str) -> datetime:
     return datetime.strptime(ts10, "%Y%m%d%H").replace(tzinfo=timezone.utc)
@@ -1542,73 +2281,6 @@ def _ts_to_dt(ts10: str) -> datetime:
 def _yyyymmdd(d) -> str:
     return d.strftime("%Y%m%d")
     
-# def _track_geojson_path() -> Optional[Path]:
-#     candidates = [
-#         Path("web") / "cn_tracks.geojson",
-#         Path("web") / "cn_tracks_src.geojson",
-#         Path("web") / "cn_tracks_src.geojson".with_suffix(".geojson"),
-#     ]
-#     for p in candidates:
-#         if p.exists():
-#             return p
-
-#     base = Path(__file__).resolve().parent / "web"
-#     for name in ("cn_tracks.geojson", "cn_tracks_src.geojson"):
-#         p = base / name
-#         if p.exists():
-#             return p
-
-#     return None
-# def _track_geojson_path() -> Path:
-#     candidates = [
-#         Path("web") / "cn_tracks.geojson",
-#         Path("web") / "cn_tracks_src.geojson",
-#         Path("web") / "NTAD_North_American_Rail_Network_Lines_CN_-6165835494608975392.geojson",
-#     ]
-#     for p in candidates:
-#         if p.exists():
-#             return p
-#     return candidates[0]  # default
-
-
-# def _load_track_points(max_points: int = 35000) -> list[tuple[float, float]]:
-#     p = _track_geojson_path()
-#     if p is None:
-#         _log("INFO", "[prewarm] cn_tracks.geojson not found")
-#         return []
-
-#     try:
-#         gj = json.loads(p.read_text(encoding="utf-8"))
-#     except Exception as e:
-#         _log("INFO", f"[prewarm] failed to read cn_tracks.geojson err={e!r}")
-#         return []
-
-#     pts: list[tuple[float, float]] = []
-
-#     def add_coords(coords):
-#         nonlocal pts
-#         if not coords:
-#             return
-#         if isinstance(coords[0], (int, float)) and len(coords) >= 2:
-#             lon, lat = float(coords[0]), float(coords[1])
-#             if np.isfinite(lon) and np.isfinite(lat):
-#                 pts.append((lon, lat))
-#             return
-#         for c in coords:
-#             add_coords(c)
-
-#     feats = gj.get("features") or []
-#     for f in feats:
-#         g = f.get("geometry") or {}
-#         add_coords(g.get("coordinates"))
-
-#     if not pts:
-#         return []
-
-#     if len(pts) > max_points:
-#         step = max(1, len(pts) // max_points)
-#         pts = pts[::step]
-#     return pts
 def _track_points_path() -> Path:
     candidates = [
         Path("web") / "cn_track_points.npz",
@@ -2042,36 +2714,6 @@ def _parse_hdr(path: Path) -> tuple[dict, str]:
         meta[re.sub(r"[^a-z0-9]+", "", k)] = v
     return meta, txt
 
-class CogCache:
-    """
-    Cache COGReader instances so we don't open/close files per tile.
-    Matches your rio-tiler based stack (COGReader.tile).
-    """
-    def __init__(self):
-        self._readers: dict[str, COGReader] = {}
-
-    def get(self, path: Path) -> COGReader:
-        key = str(path)
-        r = self._readers.get(key)
-        if r is None:
-            r = COGReader(path.as_posix())
-            self._readers[key] = r
-        return r
-
-    def close_all(self) -> None:
-        for r in self._readers.values():
-            try:
-                # rio-tiler readers generally expose close()
-                r.close()
-            except Exception:
-                pass
-        self._readers.clear()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.close_all()
 def _dtype_from_hdr(nbits: int, pixeltype: str, byteorder: str) -> np.dtype:
     pixeltype = (pixeltype or "").upper()
     byteorder = (byteorder or "I").upper()
@@ -2515,10 +3157,6 @@ def _is_probably_html(blob: bytes) -> bool:
 
 
 def _hf_try_pull_file(rel: str, timeout_sec: int = 10) -> bool:
-    """
-    Try to pull a file from HF repo with timeout protection.
-    Returns True if successful, False otherwise.
-    """
     tok, repo = _hf_cfg()
     if not tok or not repo:
         return False
@@ -2531,7 +3169,6 @@ def _hf_try_pull_file(rel: str, timeout_sec: int = 10) -> bool:
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Download with cache_dir to avoid symlinks
         tmp = hf_hub_download(
             repo_id=repo,
             repo_type="dataset",
@@ -2542,7 +3179,6 @@ def _hf_try_pull_file(rel: str, timeout_sec: int = 10) -> bool:
 
     except Exception as e:
         err_str = str(e).lower()
-        # Expected 404s for tiles not yet cached - don't log
         if "404" in err_str or "not found" in err_str:
             return False
         # Log unexpected errors
@@ -2556,8 +3192,6 @@ def _hf_try_pull_file(rel: str, timeout_sec: int = 10) -> bool:
             return False
 
         b = p.read_bytes()
-        
-        # Check for LFS pointer or tiny file
         if _is_lfs_pointer_bytes(b) or len(b) < 200:
             try:
                 p.unlink(missing_ok=True)
@@ -2565,8 +3199,6 @@ def _hf_try_pull_file(rel: str, timeout_sec: int = 10) -> bool:
             except Exception:
                 pass
             return False
-
-        # Ensure file is in the right location
         if p.resolve() != dest:
             try:
                 dest.write_bytes(b)
@@ -2762,19 +3394,25 @@ def _da_to_cog(da: xr.DataArray, out: Path) -> Path:
         crs = None
     if crs is None:
         da = da.rio.write_crs("EPSG:4326", inplace=False)
+
     da = da.astype("float32").where(np.isfinite(da)).where(da > -9990.0)
     da = da.where(~da.isnull(), nodata)
 
     with tempfile.NamedTemporaryFile(suffix=".tif", dir=str(out.parent), delete=False) as tf:
         tmp = Path(tf.name)
+
     try:
-        da.rio.to_raster(tmp.as_posix(), dtype="float32", compress="DEFLATE", nodata=float(nodata), tiled=True)
-        prof = cog_profiles.get("deflate")
-        if prof is None:
-            raise HTTPException(status_code=500, detail="rio_cogeo deflate profile missing")
-        cog_translate(tmp.as_posix(), out.as_posix(), prof, in_memory=False, quiet=True)
+        da.rio.to_raster(
+            tmp.as_posix(),
+            dtype="float32",
+            compress="DEFLATE",
+            nodata=float(nodata),
+            tiled=True,
+        )
+        _atomic_cog_translate(tmp, out)
     finally:
         tmp.unlink(missing_ok=True)
+
     return out
 
 
@@ -2860,7 +3498,9 @@ def build_72h_cog(end_date) -> Path:
             prof = base.profile.copy(); prof.update({"compress": "DEFLATE", "tiled": True})
             with rasterio.open(tmp_tif, "w", **prof) as ds:
                 ds.write(acc, 1)
-        cog_translate(tmp_tif.as_posix(), out.as_posix(), cog_profiles.get("deflate"), in_memory=False, quiet=True)
+        # cog_translate(tmp_tif.as_posix(), out.as_posix(), cog_profiles.get("deflate"), in_memory=False, quiet=True)
+        _atomic_cog_translate(tmp_tif, out)
+
         tmp_tif.unlink(missing_ok=True)
         try: _hf_enqueue_files([out])
         except Exception: pass
@@ -2870,7 +3510,6 @@ def _forecast_dir() -> Path:
     d = CACHE / "forecast"
     d.mkdir(parents=True, exist_ok=True)
     return d
-
 
 def _forecast_melt_cog(run_init: str, valid: str, lead: str, dom: str) -> Path:
     return _forecast_dir() / f"fcst_melt_{lead}_{run_init}_{valid}_{dom}_cog.tif"
@@ -2946,7 +3585,9 @@ def _forecast_melt72h_end_cog(valid: str, dom_prefer: str = "zz") -> Path:
             with rasterio.open(tmp_tif, "w", **prof) as ds:
                 ds.write(acc, 1)
 
-        cog_translate(tmp_tif.as_posix(), out.as_posix(), cog_profiles.get("deflate"), in_memory=False, quiet=True)
+        # cog_translate(tmp_tif.as_posix(), out.as_posix(), cog_profiles.get("deflate"), in_memory=False, quiet=True)
+        _atomic_cog_translate(tmp_tif, out)
+
         try: _hf_enqueue_files([out])
         except Exception: pass
 
@@ -3015,9 +3656,7 @@ def _ensure_xy_transform(da: xr.DataArray) -> xr.DataArray:
     except Exception:
         return da
 
-
 def _build_forecast_melt_cogs(run_init: str, valid: str, lead: str, melt_urls: list[str]) -> list[Path]:
-    """Build forecast melt COGs. Raises HTTPException if no usable COGs can be built."""
     run_init = _norm_ts(run_init)
     valid = _norm_ts(valid)
     lead = (lead or "").lower()
@@ -3027,7 +3666,7 @@ def _build_forecast_melt_cogs(run_init: str, valid: str, lead: str, melt_urls: l
             status_code=502, 
             detail=f"No melt URLs provided for run_init={run_init} valid={valid} lead={lead}"
         )
-    
+  
     dom2urls: dict[str, list[str]] = {}
     for u in melt_urls:
         dom2urls.setdefault(_dom_from_url(u), []).append(u)
@@ -3038,13 +3677,9 @@ def _build_forecast_melt_cogs(run_init: str, valid: str, lead: str, melt_urls: l
     with _lock(f"melt_{lead}_{run_init}_{valid}"):
         for dom in sorted(dom2urls.keys(), key=_dom_pri):
             out = _forecast_melt_cog(run_init, valid, lead, dom)
-            
-            # Check if already exists
             if out.exists() and out.stat().st_size > 0:
                 built.append(out)
                 continue
-            
-            # Try to build from URLs
             last_err = None
             for url in dom2urls[dom]:
                 low = Path(url).name.lower()
@@ -3212,13 +3847,9 @@ def _read_mask_tile(ts: str, urls: list[str], z: int, x: int, y: int) -> tuple[O
 
 def _cog_point_data_mask(r: COGReader, lon: float, lat: float) -> tuple[np.ndarray, np.ndarray]:
     out = r.point(lon, lat)
-
-    # rio-tiler older behavior: (data, mask)
     if isinstance(out, (tuple, list)) and len(out) == 2:
         data, mask = out
         return np.asarray(data), np.asarray(mask)
-
-    # rio-tiler newer behavior: ImageData-like object with .data/.mask
     data = getattr(out, "data", None)
     mask = getattr(out, "mask", None)
     if data is None or mask is None:
@@ -3271,14 +3902,10 @@ def _is_corridor_tile(z: int, x: int, y: int) -> bool:
 
 def _effective_request_tile(z: int, x: int, y: int) -> tuple[int, int, int, str]:
     z = int(z); x = int(x); y = int(y)
-
     if not _tile_allowed(z, x, y):
         return z, x, y, "none"
-
     if _is_corridor_tile(z, x, y):
         return z, x, y, "hi"
-
-    # off-track but allowed: serve low-res parent tile
     z_lr = min(int(LOWRES_Z), z)
     if z <= z_lr:
         return z, x, y, "lo"
@@ -3333,14 +3960,9 @@ def _tiles_within_miles(points: list[tuple[float, float]], z: int, miles: float,
 _BAKING_MODE = threading.local()
 
 def _is_baking_mode() -> bool:
-    """Check if we're in baking mode (should use reduced concurrency)."""
     return getattr(_BAKING_MODE, "active", False)
 
 class _BakingMode:
-    """
-    Context manager that signals we're in baking mode.
-    Does NOT replace semaphores - just sets a flag workers can check.
-    """
     def __init__(self):
         self.prev = None
         
@@ -3365,7 +3987,6 @@ def _bake_corridor_raw_tiles_for_date(
     conc: int = 2,
     push_every: int = 500,
 ) -> dict:
-    """Bake corridor RAW tiles with incremental HF push."""
     dom = (dom or "zz").lower()
     _log("DEBUG", f"[bake_corridor_raw] Starting for {date_yyyymmdd}")
 
@@ -3386,29 +4007,12 @@ def _bake_corridor_raw_tiles_for_date(
     skip = 0
     fail = 0
     lk = threading.Lock()
-    
-    pending_push: list[Path] = []
-    total_pushed = 0
-    push_lk = threading.Lock()
 
-    def maybe_push():
-        nonlocal pending_push, total_pushed
-        with push_lk:
-            if len(pending_push) >= push_every:
-                batch = pending_push[:push_every]
-                pending_push = pending_push[push_every:]
-                
-                result = _incremental_hf_push(
-                    batch, 
-                    "rawtilecache", 
-                    f"{date_yyyymmdd}_corridor_raw_{total_pushed}"
-                )
-                if result.get("ok"):
-                    total_pushed += result.get("pushed", 0)
-                    _log("DEBUG", f"[bake_corridor_raw] Pushed {result.get('pushed', 0)} tiles to HF")
+    # We still track local files written; remote upload deferred to uploader loop.
+    pending_paths_count = 0
 
     def worker():
-        nonlocal ok, skip, fail, pending_push
+        nonlocal ok, skip, fail, pending_paths_count
         with _HfPullOnMiss(False):
             while True:
                 with lk:
@@ -3416,14 +4020,14 @@ def _bake_corridor_raw_tiles_for_date(
                         return
                     hours, z, x, y = q.popleft()
                     processed = total_jobs - len(q)
-                
+
                 try:
                     p = _raw_tile_cache_path(dom, hours, date_yyyymmdd, z, x, y)
                     if _is_valid_npz_file(p):
                         with lk:
                             skip += 1
                         continue
-                    
+
                     raw, _ = _generate_forecast_by_date_raw_impl(
                         z=z, x=x, y=y,
                         date_yyyymmdd=date_yyyymmdd,
@@ -3431,16 +4035,14 @@ def _bake_corridor_raw_tiles_for_date(
                         dom=dom,
                     )
                     _raw_tile_cache_put(dom, hours, date_yyyymmdd, z, x, y, raw)
-                    
+
                     with lk:
                         ok += 1
-                        pending_push.append(p)
-                    
-                    maybe_push()
-                    
+                        pending_paths_count += 1
+
                     if processed % 500 == 0:
                         _log("DEBUG", f"[bake_corridor_raw] {date_yyyymmdd}: {processed}/{total_jobs}")
-                        
+
                 except Exception as e:
                     with lk:
                         if fail < 5:
@@ -3453,15 +4055,8 @@ def _bake_corridor_raw_tiles_for_date(
     for t in threads:
         t.join()
 
-    # Final push
-    with push_lk:
-        if pending_push:
-            result = _incremental_hf_push(pending_push, "rawtilecache", f"{date_yyyymmdd}_corridor_raw_final")
-            if result.get("ok"):
-                total_pushed += result.get("pushed", 0)
-            pending_push = []
-
-    _log("INFO", f"[bake_corridor_raw] {date_yyyymmdd} complete: ok={ok}, skip={skip}, fail={fail}, pushed={total_pushed}")
+    # Do not call _incremental_hf_push here. Remote upload is deferred to uploader thread.
+    _log("INFO", f"[bake_corridor_raw] {date_yyyymmdd} complete: ok={ok}, skip={skip}, fail={fail}, local_written={pending_paths_count}")
 
     return {
         "ok": True,
@@ -3473,84 +4068,9 @@ def _bake_corridor_raw_tiles_for_date(
         "ok_count": ok,
         "skip_count": skip,
         "fail_count": fail,
-        "pushed_count": total_pushed,
+        "pushed_count": 0,
+        "remote_push": "deferred",
     }
-# def _bake_lowres_box_raw_tiles_for_date(
-#     *,
-#     date_yyyymmdd: str,
-#     dom: str,
-#     hours_list: list[int],
-#     zmin: int,
-#     zmax: int,
-#     conc: int = 6,
-# ) -> dict:
-#     dom = (dom or "zz").lower()
-
-#     # Same boxes used by _tile_allowed()
-#     box_a = (-170.0, 49.0, -40.0, 90.0)  # (w,s,e,n)
-#     box_b = (-97.0, 37.0, -63.0, 49.0)   # (w,s,e,n)
-#     boxes = [box_a, box_b]
-
-#     tiles = _tiles_for_boxes_zoom_range(boxes, zmin=int(zmin), zmax=int(zmax))
-#     if not tiles:
-#         return {"ok": False, "error": "no_lowres_tiles"}
-
-#     q = deque()
-#     for hours in hours_list:
-#         for (z, x, y) in tiles:
-#             q.append((int(hours), int(z), int(x), int(y)))
-
-#     ok = 0
-#     fail = 0
-#     lk = threading.Lock()
-
-#     def worker():
-#         nonlocal ok, fail
-#         with _HfPullOnMiss(False):
-#             while True:
-#                 with lk:
-#                     if not q:
-#                         return
-#                     hours, z, x, y = q.popleft()
-
-#                 try:
-#                     p = _raw_tile_cache_path(dom, hours, date_yyyymmdd, z, x, y)
-#                     if _is_valid_npz_file(p):
-#                         ok += 1
-#                         continue
-
-#                     raw, _ = _generate_forecast_by_date_raw(
-#                         z=z, x=x, y=y,
-#                         date_yyyymmdd=date_yyyymmdd,
-#                         hours=hours,
-#                         dom=dom,
-#                     )
-#                     _raw_tile_cache_put(dom, hours, date_yyyymmdd, z, x, y, raw)
-#                     ok += 1
-
-#                 except Exception as e:
-#                     if fail < 5:
-#                         _log("WARN", f"[bake_lowres_raw] tile failed z={z} x={x} y={y} err={e!r}")
-#                     fail += 1
-
-#     threads = [threading.Thread(target=worker, daemon=True) for _ in range(int(conc))]
-#     for t in threads:
-#         t.start()
-#     for t in threads:
-#         t.join()
-
-#     return {
-#         "ok": True,
-#         "date": date_yyyymmdd,
-#         "dom": dom,
-#         "hours_list": hours_list,
-#         "tiles": len(tiles),
-#         "jobs": len(tiles) * len(hours_list),
-#         "ok_count": ok,
-#         "fail_count": fail,
-#         "zmin": zmin,
-#         "zmax": zmax,
-#     }
 
 
 def _bake_lowres_box_tiles_for_date(
@@ -3563,7 +4083,7 @@ def _bake_lowres_box_tiles_for_date(
     conc: int = 2,
     push_every: int = 300,
 ) -> dict:
-    """Bake lowres PNG tiles with incremental HF push."""
+    """Bake lowres PNG tiles; remote push deferred to uploader."""
     dom = (dom or "zz").lower()
     _log("DEBUG", f"[bake_lowres] Starting for {date_yyyymmdd}")
 
@@ -3585,24 +4105,11 @@ def _bake_lowres_box_tiles_for_date(
     skip = 0
     fail = 0
     lk = threading.Lock()
-    
-    pending_push: list[Path] = []
-    total_pushed = 0
-    push_lk = threading.Lock()
 
-    def maybe_push():
-        nonlocal pending_push, total_pushed
-        with push_lk:
-            if len(pending_push) >= push_every:
-                batch = pending_push[:push_every]
-                pending_push = pending_push[push_every:]
-                
-                result = _incremental_hf_push(batch, "tilecache", f"{date_yyyymmdd}_lowres_png_{total_pushed}")
-                if result.get("ok"):
-                    total_pushed += result.get("pushed", 0)
+    pending_paths_count = 0
 
     def worker():
-        nonlocal ok, skip, fail, pending_push
+        nonlocal ok, skip, fail, pending_paths_count
         with _HfPullOnMiss(False):
             while True:
                 with lk:
@@ -3610,14 +4117,14 @@ def _bake_lowres_box_tiles_for_date(
                         return
                     hours, z, x, y = q.popleft()
                     processed = total_jobs - len(q)
-                
+
                 try:
                     p = _tile_cache_path(dom, hours, date_yyyymmdd, z, x, y)
                     if _is_valid_png_file(p):
                         with lk:
                             skip += 1
                         continue
-                    
+
                     png, _ = _generate_forecast_by_date_png_impl(
                         z=z, x=x, y=y,
                         date_yyyymmdd=date_yyyymmdd,
@@ -3626,16 +4133,14 @@ def _bake_lowres_box_tiles_for_date(
                         max_in=None,
                     )
                     _tile_cache_put(dom, hours, date_yyyymmdd, z, x, y, png)
-                    
+
                     with lk:
                         ok += 1
-                        pending_push.append(p)
-                    
-                    maybe_push()
-                    
+                        pending_paths_count += 1
+
                     if processed % 200 == 0:
                         _log("DEBUG", f"[bake_lowres] {date_yyyymmdd}: {processed}/{total_jobs}")
-                        
+
                 except Exception as e:
                     with lk:
                         if fail < 5:
@@ -3648,14 +4153,7 @@ def _bake_lowres_box_tiles_for_date(
     for t in threads:
         t.join()
 
-    with push_lk:
-        if pending_push:
-            result = _incremental_hf_push(pending_push, "tilecache", f"{date_yyyymmdd}_lowres_png_final")
-            if result.get("ok"):
-                total_pushed += result.get("pushed", 0)
-            pending_push = []
-
-    _log("INFO", f"[bake_lowres] {date_yyyymmdd} complete: ok={ok}, skip={skip}, fail={fail}, pushed={total_pushed}")
+    _log("INFO", f"[bake_lowres] {date_yyyymmdd} complete: ok={ok}, skip={skip}, fail={fail}, local_written={pending_paths_count}")
 
     return {
         "ok": True,
@@ -3663,7 +4161,8 @@ def _bake_lowres_box_tiles_for_date(
         "ok_count": ok,
         "skip_count": skip,
         "fail_count": fail,
-        "pushed_count": total_pushed,
+        "pushed_count": 0,
+        "remote_push": "deferred",
     }
 
 
@@ -3677,7 +4176,7 @@ def _bake_lowres_box_raw_tiles_for_date(
     conc: int = 2,
     push_every: int = 300,
 ) -> dict:
-    """Bake lowres RAW tiles with incremental HF push."""
+    """Bake lowres RAW tiles; remote push deferred to uploader."""
     dom = (dom or "zz").lower()
     _log("DEBUG", f"[bake_lowres_raw] Starting for {date_yyyymmdd}")
 
@@ -3699,24 +4198,11 @@ def _bake_lowres_box_raw_tiles_for_date(
     skip = 0
     fail = 0
     lk = threading.Lock()
-    
-    pending_push: list[Path] = []
-    total_pushed = 0
-    push_lk = threading.Lock()
 
-    def maybe_push():
-        nonlocal pending_push, total_pushed
-        with push_lk:
-            if len(pending_push) >= push_every:
-                batch = pending_push[:push_every]
-                pending_push = pending_push[push_every:]
-                
-                result = _incremental_hf_push(batch, "rawtilecache", f"{date_yyyymmdd}_lowres_raw_{total_pushed}")
-                if result.get("ok"):
-                    total_pushed += result.get("pushed", 0)
+    pending_paths_count = 0
 
     def worker():
-        nonlocal ok, skip, fail, pending_push
+        nonlocal ok, skip, fail, pending_paths_count
         with _HfPullOnMiss(False):
             while True:
                 with lk:
@@ -3724,14 +4210,14 @@ def _bake_lowres_box_raw_tiles_for_date(
                         return
                     hours, z, x, y = q.popleft()
                     processed = total_jobs - len(q)
-                
+
                 try:
                     p = _raw_tile_cache_path(dom, hours, date_yyyymmdd, z, x, y)
                     if _is_valid_npz_file(p):
                         with lk:
                             skip += 1
                         continue
-                    
+
                     raw, _ = _generate_forecast_by_date_raw_impl(
                         z=z, x=x, y=y,
                         date_yyyymmdd=date_yyyymmdd,
@@ -3739,16 +4225,14 @@ def _bake_lowres_box_raw_tiles_for_date(
                         dom=dom,
                     )
                     _raw_tile_cache_put(dom, hours, date_yyyymmdd, z, x, y, raw)
-                    
+
                     with lk:
                         ok += 1
-                        pending_push.append(p)
-                    
-                    maybe_push()
-                    
+                        pending_paths_count += 1
+
                     if processed % 200 == 0:
                         _log("DEBUG", f"[bake_lowres_raw] {date_yyyymmdd}: {processed}/{total_jobs}")
-                        
+
                 except Exception as e:
                     with lk:
                         if fail < 5:
@@ -3761,14 +4245,7 @@ def _bake_lowres_box_raw_tiles_for_date(
     for t in threads:
         t.join()
 
-    with push_lk:
-        if pending_push:
-            result = _incremental_hf_push(pending_push, "rawtilecache", f"{date_yyyymmdd}_lowres_raw_final")
-            if result.get("ok"):
-                total_pushed += result.get("pushed", 0)
-            pending_push = []
-
-    _log("INFO", f"[bake_lowres_raw] {date_yyyymmdd} complete: ok={ok}, skip={skip}, fail={fail}, pushed={total_pushed}")
+    _log("INFO", f"[bake_lowres_raw] {date_yyyymmdd} complete: ok={ok}, skip={skip}, fail={fail}, local_written={pending_paths_count}")
 
     return {
         "ok": True,
@@ -3776,7 +4253,8 @@ def _bake_lowres_box_raw_tiles_for_date(
         "ok_count": ok,
         "skip_count": skip,
         "fail_count": fail,
-        "pushed_count": total_pushed,
+        "pushed_count": 0,
+        "remote_push": "deferred",
     }
 
 
@@ -3803,8 +4281,6 @@ def _hf_push_rawtilecache_for_window(
     ops: list[CommitOperationAdd] = []
     pushed = 0
     skipped = 0
-
-    # RAW_TILE_EXT is ".npz" in your code
     for p in root.rglob(f"bydate_*{RAW_TILE_EXT}"):
         name = p.name
 
@@ -3956,18 +4432,37 @@ def _tile_arrays_from_cog(
     *,
     cog_cache: CogCache,
 ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], bool]:
-    if not cog.exists() or cog.stat().st_size <= 0:
+    if (not cog.exists()) or (cog.stat().st_size <= 0):
         raise HTTPException(status_code=500, detail=f"COG missing: {cog.name}")
-    try:
+
+    def _read_once() -> tuple[Optional[np.ndarray], Optional[np.ndarray], bool]:
         r = cog_cache.get(cog)
         data, mask = r.tile(x, y, z, tilesize=256, resampling_method="nearest")
         return data[0].astype("float32"), mask[0].astype("uint8"), False
+
+    try:
+        return _read_once()
     except TileOutsideBounds:
         return None, None, True
+    except Exception as e:
+        # Evict + retry once (common fix for transient TIFFReadEncodedTile failures)
+        try:
+            cog_cache.evict(cog)  # <-- you need to add this method (below)
+        except Exception:
+            pass
+        try:
+            return _read_once()
+        except TileOutsideBounds:
+            return None, None, True
+        except Exception as e2:
+            _log("WARN", f"[cog_read] failed cog={cog.name} z={z} x={x} y={y} err={e2!r}")
+            # Optionally: mark this COG as bad and force rebuild in your forecast builder.
+            return None, None, True
+
 
 
 def _tile_png_from_cog(cog: Path, z: int, x: int, y: int, max_in: Optional[float]) -> bytes:
-    arr, mask, oob = _tile_arrays_from_cog(cog, z, x, y)
+    arr, mask, oob = _tile_arrays_from_cog(cog, z, x, y, cog_cache=cog_cache)
     if oob or arr is None or mask is None:
         return _transparent_png_256()
     return _melt_to_png(arr, mask, max_in, None, None)
@@ -4005,10 +4500,7 @@ def _serve_forecast_tile(
                 "X-NoData": "1",
             },
         )
-
-
     melt_mask_u8 = (melt_valid.astype("uint8") * 255)
-
     png = _melt_to_png(
         melt_mm,
         melt_mask_u8,
@@ -4062,8 +4554,6 @@ def _point_mm_from_cog(cog: Path, lon: float, lat: float) -> tuple[Optional[floa
     try:
         with COGReader(cog.as_posix()) as r:
             data, mask = _cog_point_data_mask(r, lon, lat)
-
-        # data/mask are typically shaped (bands,) for point queries
         v = float(np.ravel(data)[0])
         m = int(np.ravel(mask)[0])
 
@@ -4087,90 +4577,6 @@ def _union_point_mm(cogs: list[Path], lon: float, lat: float) -> tuple[Optional[
             return v, "union:" + info
     return None, "union_fail:" + ",".join(used[:6])
 
-# def _bake_corridor_tiles_for_date(
-#     *,
-#     date_yyyymmdd: str,
-#     dom: str,
-#     hours_list: list[int],
-#     zmin: int,
-#     zmax: int,
-#     miles: float,
-#     cap_per_zoom: int,
-#     max_tiles_total: int,
-#     conc: int = 6,
-# ) -> dict:
-#     dom = (dom or "zz").lower()
-
-#     tiles = _corridor_tiles_for_zoom_range(zmin, zmax, miles=float(miles), cap_per_zoom=int(cap_per_zoom))
-#     if not tiles:
-#         return {"ok": False, "error": "no_tiles_or_no_track_points"}
-
-#     tiles = tiles[: int(max_tiles_total)]
-
-#     q = deque()
-#     for hours in hours_list:
-#         for (z, x, y) in tiles:
-#             q.append((int(hours), int(z), int(x), int(y)))
-
-#     ok = 0
-#     fail = 0
-#     lk = threading.Lock()
-
-#     def worker():
-#         nonlocal ok, fail
-#         # Disable HF pulls during baking - we're generating tiles, not pulling them
-#         with _HfPullOnMiss(False):
-#             while True:
-#                 with lk:
-#                     if not q:
-#                         return
-#                     hours, z, x, y = q.popleft()
-#                 try:
-#                     # Check if already exists locally (skip HF check)
-#                     p = _tile_cache_path(dom, hours, date_yyyymmdd, z, x, y)
-#                     if _is_valid_png_file(p):
-#                         ok += 1
-#                         continue
-                    
-#                     # Generate the tile
-#                     png, _ = _generate_forecast_by_date_png(
-#                         z=z, x=x, y=y,
-#                         date_yyyymmdd=date_yyyymmdd,
-#                         hours=hours,
-#                         dom=dom,
-#                         max_in=None,
-#                     )
-#                     _tile_cache_put(dom, hours, date_yyyymmdd, z, x, y, png)
-#                     ok += 1
-#                 except Exception as e:
-#                     # Log first few failures for debugging
-#                     if fail < 5:
-#                         _log("WARN", f"[bake] tile failed z={z} x={x} y={y} err={e!r}")
-#                     fail += 1
-
-#     threads = [threading.Thread(target=worker, daemon=True) for _ in range(int(conc))]
-#     for t in threads:
-#         t.start()
-#     for t in threads:
-#         t.join()
-
-#     return {
-#         "ok": True,
-#         "date": date_yyyymmdd,
-#         "dom": dom,
-#         "hours_list": hours_list,
-#         "tiles": len(tiles),
-#         "jobs": len(hours_list) * len(tiles),
-#         "ok_count": ok,
-#         "fail_count": fail,
-#         "zmin": zmin,
-#         "zmax": zmax,
-#         "miles": float(miles),
-#         "cap_per_zoom": int(cap_per_zoom),
-#         "max_tiles_total": int(max_tiles_total),
-#     }
-
-
 def _bake_corridor_tiles_for_date(
     *,
     date_yyyymmdd: str,
@@ -4182,9 +4588,8 @@ def _bake_corridor_tiles_for_date(
     cap_per_zoom: int,
     max_tiles_total: int,
     conc: int = 2,
-    push_every: int = 500,  # Push to HF every N tiles
+    push_every: int = 500,
 ) -> dict:
-    """Bake corridor PNG tiles with incremental HF push."""
     dom = (dom or "zz").lower()
     _log("DEBUG", f"[bake_corridor] Starting for {date_yyyymmdd}")
 
@@ -4205,21 +4610,16 @@ def _bake_corridor_tiles_for_date(
     skip = 0
     fail = 0
     lk = threading.Lock()
-    
-    # Track tiles for incremental push
     pending_push: list[Path] = []
     total_pushed = 0
     push_lk = threading.Lock()
 
     def maybe_push():
-        """Push pending tiles if we have enough."""
         nonlocal pending_push, total_pushed
         with push_lk:
             if len(pending_push) >= push_every:
                 batch = pending_push[:push_every]
                 pending_push = pending_push[push_every:]
-                
-                # Push in background to not block baking
                 result = _incremental_hf_push(
                     batch, 
                     "tilecache", 
@@ -4247,8 +4647,6 @@ def _bake_corridor_tiles_for_date(
                         with lk:
                             skip += 1
                         continue
-                    
-                    # Generate tile
                     png, _ = _generate_forecast_by_date_png_impl(
                         z=z, x=x, y=y,
                         date_yyyymmdd=date_yyyymmdd,
@@ -4261,11 +4659,7 @@ def _bake_corridor_tiles_for_date(
                     with lk:
                         ok += 1
                         pending_push.append(p)
-                    
-                    # Check if we should push
                     maybe_push()
-                    
-                    # Log progress every 500 tiles
                     if processed % 500 == 0:
                         _log("DEBUG", f"[bake_corridor] {date_yyyymmdd}: {processed}/{total_jobs} (ok={ok}, skip={skip}, fail={fail})")
                         
@@ -4280,8 +4674,6 @@ def _bake_corridor_tiles_for_date(
         t.start()
     for t in threads:
         t.join()
-
-    # Final push of remaining tiles
     with push_lk:
         if pending_push:
             result = _incremental_hf_push(
@@ -4324,18 +4716,27 @@ def _prune_tile_cache(keep_ymds: set[str], keep_days_fallback: int) -> int:
     root = _tile_cache_dir()
     if not root.exists():
         return 0
-    for p in root.rglob("bydate_*.png"):
-        try:
-            m = re.search(r"_([0-9]{8})_z", p.name)
-            ymd = m.group(1) if m else None
-            if not ymd:
-                continue
-            if (ymd in keep_ymds) or (ymd >= cutoff):
-                continue
-            p.unlink(missing_ok=True)
-            deleted += 1
-        except Exception:
+
+    for dom_dir in root.iterdir():
+        if not dom_dir.is_dir():
             continue
+        for hours_dir in dom_dir.iterdir():
+            if not hours_dir.is_dir():
+                continue
+            for ymd_dir in hours_dir.iterdir():
+                if not ymd_dir.is_dir():
+                    continue
+                ymd = ymd_dir.name
+                if not re.fullmatch(r"[0-9]{8}", ymd):
+                    continue
+                if (ymd in keep_ymds) or (ymd >= cutoff):
+                    continue
+                try:
+                    shutil.rmtree(ymd_dir, ignore_errors=True)
+                    deleted += 1
+                except Exception:
+                    pass
+
     return deleted
 
 def _prune_raw_tile_cache(keep_ymds: set[str], keep_days_fallback: int) -> int:
@@ -4344,18 +4745,27 @@ def _prune_raw_tile_cache(keep_ymds: set[str], keep_days_fallback: int) -> int:
     root = _raw_tile_cache_dir()
     if not root.exists():
         return 0
-    for p in root.rglob(f"bydate_*{RAW_TILE_EXT}"):
-        try:
-            m = re.search(r"_([0-9]{8})_z", p.name)
-            ymd = m.group(1) if m else None
-            if not ymd:
-                continue
-            if (ymd in keep_ymds) or (ymd >= cutoff):
-                continue
-            p.unlink(missing_ok=True)
-            deleted += 1
-        except Exception:
+
+    for dom_dir in root.iterdir():
+        if not dom_dir.is_dir():
             continue
+        for hours_dir in dom_dir.iterdir():
+            if not hours_dir.is_dir():
+                continue
+            for ymd_dir in hours_dir.iterdir():
+                if not ymd_dir.is_dir():
+                    continue
+                ymd = ymd_dir.name
+                if not re.fullmatch(r"[0-9]{8}", ymd):
+                    continue
+                if (ymd in keep_ymds) or (ymd >= cutoff):
+                    continue
+                try:
+                    shutil.rmtree(ymd_dir, ignore_errors=True)
+                    deleted += 1
+                except Exception:
+                    pass
+
     return deleted
 
 def _prune_forecast_cogs(keep_days: int) -> int:
@@ -4376,22 +4786,38 @@ def _ensure_forecast_cogs_for_date(date_yyyymmdd: str, dom: str) -> dict:
     dom = (dom or "zz").lower()
     valid = _norm_ts(f"{date_yyyymmdd}05")
 
-    # 24h (build melt + snowpack COGs opportunistically)
     sel = _pick_forecast_for_valid(valid, dom_prefer=dom)
     if not sel.get("ok"):
         return {"ok": False, "date": date_yyyymmdd, "error": "pick_failed", "detail": sel}
 
-    melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+    try:
+        _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+    except Exception as e:
+        return {"ok": False, "date": date_yyyymmdd, "valid": sel["valid"], "error": f"melt_build_failed:{e!r}"}
 
-    snow_cogs = []
     if sel.get("snowpack_urls"):
         try:
-            snow_cogs = _build_forecast_snowpack_cogs(sel["valid"], sel["snowpack_urls"])
+            _build_forecast_snowpack_cogs(sel.get("snowpack_ts") or sel["valid"], sel["snowpack_urls"])
         except Exception:
-            snow_cogs = []
+            pass
 
-    # 72h (reuses built 24h cogs for v0,v1,v2)
-    melt72 = _forecast_melt72h_end_cog(sel["valid"], dom_prefer=dom)
+    melt24_union = None
+    snow_union = None
+    try:
+        melt24_union = _forecast_melt24h_union_end_cog(sel["valid"], dom_prefer=dom)
+    except Exception as e:
+        _log("WARN", f"[ensure_forecast] 24h UNION melt failed for {sel['valid']}: {e!r}")
+
+    try:
+        snow_union = _forecast_snowpack_union_end_cog(sel.get("snowpack_ts") or sel["valid"], dom_prefer=dom)
+    except Exception as e:
+        _log("WARN", f"[ensure_forecast] UNION snowpack failed for {sel['valid']}: {e!r}")
+
+    melt72 = None
+    try:
+        melt72 = _forecast_melt72h_end_cog(sel["valid"], dom_prefer=dom)
+    except Exception as e:
+        _log("WARN", f"[ensure_forecast] 72h COG failed for {sel['valid']}: {e!r}")
 
     return {
         "ok": True,
@@ -4399,34 +4825,44 @@ def _ensure_forecast_cogs_for_date(date_yyyymmdd: str, dom: str) -> dict:
         "valid": sel["valid"],
         "tt": sel["run_init"],
         "dom": dom,
-        "melt24_cogs": [p.name for p in melt_cogs[:3]],
-        "snow_cogs": [p.name for p in snow_cogs[:3]],
-        "melt72_cog": melt72.name,
+        "melt24_union_cog": (melt24_union.name if melt24_union else None),
+        "snow_union_cog": (snow_union.name if snow_union else None),
+        "melt72_cog": (melt72.name if melt72 else None),
     }
+
 
 def _ensure_forecast_for_valid(valid: str, dom_prefer: str = "zz") -> dict:
     dom_prefer = (dom_prefer or "zz").lower()
     valid = _norm_ts(valid)
     date_yyyymmdd = valid[:8]
 
-    # Build 24h COGs
     sel = _pick_forecast_for_valid(valid, dom_prefer=dom_prefer)
     if not sel.get("ok"):
         return {"ok": False, "date": date_yyyymmdd, "valid": valid, "error": "pick_failed", "detail": sel}
 
     try:
-        melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+        _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
     except Exception as e:
-        return {"ok": False, "date": date_yyyymmdd, "valid": valid, "error": f"melt_build_failed: {e!r}"}
+        return {"ok": False, "date": date_yyyymmdd, "valid": valid, "error": f"melt_build_failed:{e!r}"}
 
-    snow_cogs = []
     if sel.get("snowpack_urls"):
         try:
-            snow_cogs = _build_forecast_snowpack_cogs(sel["valid"], sel["snowpack_urls"])
+            _build_forecast_snowpack_cogs(sel.get("snowpack_ts") or sel["valid"], sel["snowpack_urls"])
         except Exception:
-            snow_cogs = []
+            pass
 
-    # Build 72h COG (reuses the built 24h cogs for v0, v1, v2)
+    melt24_union = None
+    snow_union = None
+    try:
+        melt24_union = _forecast_melt24h_union_end_cog(sel["valid"], dom_prefer=dom_prefer)
+    except Exception as e:
+        _log("WARN", f"[ensure_forecast] 24h UNION melt failed for {valid}: {e!r}")
+
+    try:
+        snow_union = _forecast_snowpack_union_end_cog(sel.get("snowpack_ts") or sel["valid"], dom_prefer=dom_prefer)
+    except Exception as e:
+        _log("WARN", f"[ensure_forecast] UNION snowpack failed for {valid}: {e!r}")
+
     melt72 = None
     melt72_name = None
     try:
@@ -4434,19 +4870,7 @@ def _ensure_forecast_for_valid(valid: str, dom_prefer: str = "zz") -> dict:
         melt72_name = melt72.name if melt72 else None
     except Exception as e:
         _log("WARN", f"[ensure_forecast] 72h COG failed for {valid}: {e!r}")
-    # inside _ensure_forecast_for_valid (after melt_cogs / snow_cogs are built)
-    melt24_union = None
-    snow_union = None
-    try:
-        melt24_union = _forecast_melt24h_union_cog(sel["valid"], dom_prefer=dom_prefer)
-    except Exception as e:
-        _log("WARN", f"[ensure_forecast] melt24_union failed for {valid}: {e!r}")
-    
-    try:
-        snow_union = _forecast_snowpack_union_cog(sel["valid"], dom_prefer=dom_prefer)
-    except Exception as e:
-        _log("WARN", f"[ensure_forecast] snow_union failed for {valid}: {e!r}")
-    
+
     return {
         "ok": True,
         "date": date_yyyymmdd,
@@ -4467,8 +4891,6 @@ def _next_run_local(now: datetime | None = None) -> datetime:
 
 
 def _run_daily_roll_job_once() -> dict:
-    from datetime import datetime, timedelta
-    
     started = datetime.utcnow().isoformat()
     _log("INFO", f"[roll] ========== BAKING JOB STARTED ==========")
     
@@ -4477,15 +4899,11 @@ def _run_daily_roll_job_once() -> dict:
     keep_set = set(window)
     
     _log("INFO", f"[roll] local_today={today_local.isoformat()} window={window}")
-
-    # Step 1: Pull existing cache from HF
     _log("INFO", "[roll] Step 1: Pulling HF cache")
     try:
         _hf_pull_cache()
     except Exception as e:
         _log("WARN", f"[roll] hf_pull_cache failed: {e!r}")
-
-    # Step 2: Prune old tiles
     _log("INFO", "[roll] Step 2: Pruning old tiles")
     del_tiles = _prune_tile_cache(keep_set, KEEP_TILE_DAYS)
     del_raw_tiles = _prune_raw_tile_cache(keep_set, KEEP_TILE_DAYS)
@@ -4496,8 +4914,6 @@ def _run_daily_roll_job_once() -> dict:
         _tile_png_cached.cache_clear()
     except Exception:
         pass
-
-    # Step 3: Build forecast COGs FIRST (critical for 72h)
     _log("INFO", "[roll] Step 3: Building forecast COGs")
     ensured = []
     with _HfPullOnMiss(True):
@@ -4510,21 +4926,16 @@ def _run_daily_roll_job_once() -> dict:
             except Exception as e:
                 _log("ERROR", f"[roll] COG build failed for {ymd}: {e!r}")
                 ensured.append({"ok": False, "date": ymd, "error": f"ensure_exc:{e!r}"})
-
-    # Step 4: Bake tiles - SEQUENTIAL per date, PARALLEL within date
     _log("INFO", "[roll] Step 4: Baking tiles")
     baked_results = {"corridor": [], "corridor_raw": [], "lowres": [], "lowres_raw": []}
     
     conc = max(1, min(6, int(os.environ.get("BAKE_CONCURRENCY", "6"))))
     
     with _BakingMode():
-        with _HfPullOnMiss(False):  # Don't pull while baking - we're generating
+        with _HfPullOnMiss(False):
             for i, ymd in enumerate(window):
                 _log("INFO", f"[roll] Baking tiles for {ymd} ({i+1}/{len(window)})")
-                
-                # Bake all four tile types for this date
                 try:
-                    # PNG tiles - corridor
                     _log("INFO", f"[roll] {ymd}: Baking corridor PNG tiles")
                     corridor = _bake_corridor_tiles_for_date(
                         date_yyyymmdd=ymd,
@@ -4544,7 +4955,6 @@ def _run_daily_roll_job_once() -> dict:
                     baked_results["corridor"].append({"ok": False, "date": ymd, "error": str(e)})
 
                 try:
-                    # Raw tiles - corridor
                     _log("INFO", f"[roll] {ymd}: Baking corridor RAW tiles")
                     corridor_raw = _bake_corridor_raw_tiles_for_date(
                         date_yyyymmdd=ymd,
@@ -4564,7 +4974,6 @@ def _run_daily_roll_job_once() -> dict:
                     baked_results["corridor_raw"].append({"ok": False, "date": ymd, "error": str(e)})
 
                 try:
-                    # PNG tiles - lowres box
                     _log("INFO", f"[roll] {ymd}: Baking lowres PNG tiles")
                     lowres = _bake_lowres_box_tiles_for_date(
                         date_yyyymmdd=ymd,
@@ -4581,7 +4990,6 @@ def _run_daily_roll_job_once() -> dict:
                     baked_results["lowres"].append({"ok": False, "date": ymd, "error": str(e)})
 
                 try:
-                    # Raw tiles - lowres box
                     _log("INFO", f"[roll] {ymd}: Baking lowres RAW tiles")
                     lowres_raw = _bake_lowres_box_raw_tiles_for_date(
                         date_yyyymmdd=ymd,
@@ -4596,8 +5004,6 @@ def _run_daily_roll_job_once() -> dict:
                 except Exception as e:
                     _log("ERROR", f"[roll] {ymd}: lowres_raw bake failed: {e!r}")
                     baked_results["lowres_raw"].append({"ok": False, "date": ymd, "error": str(e)})
-
-    # Step 5: Push tiles to HF
     _log("INFO", "[roll] Step 5: Pushing tiles to HF")
     pushed_tiles = None
     pushed_raw_tiles = None
@@ -4622,7 +5028,6 @@ def _run_daily_roll_job_once() -> dict:
         _log("ERROR", f"[roll] RAW tile push failed: {e!r}")
         pushed_raw_tiles = {"ok": False, "error": str(e)}
 
-    # Step 6: Prune and flush
     _log("INFO", "[roll] Step 6: Final prune and flush")
     try:
         _hf_prune_remote_and_local(keep_days=max(KEEP_FORECAST_COG_DAYS, KEEP_TILE_DAYS))
@@ -4667,83 +5072,56 @@ def _bake_corridor_tiles_for_date_optimized(
     max_tiles_total: int,
     push_every: int = 300,
 ) -> dict:
-    """
-    Optimized single-threaded corridor PNG baking.
-    - Pre-loads COGs once
-    - No threading (avoids all lock issues)
-    - Pushes incrementally
-    """
     dom = (dom or "zz").lower()
     _log("INFO", f"[bake_corridor_opt] Starting for {date_yyyymmdd}")
 
-    # Get tile list
     tiles = _corridor_tiles_for_zoom_range(zmin, zmax, miles=float(miles), cap_per_zoom=int(cap_per_zoom))
     if not tiles:
         return {"ok": False, "error": "no_tiles"}
     tiles = tiles[:int(max_tiles_total)]
-    
-    # Build job queue
+
     jobs = [(int(h), int(z), int(x), int(y)) for h in hours_list for (z, x, y) in tiles]
     total_jobs = len(jobs)
     _log("INFO", f"[bake_corridor_opt] {total_jobs} tiles to process")
-    
+
     ok = 0
     skip = 0
     fail = 0
-    pending_push: list[Path] = []
-    total_pushed = 0
-    
-    # Use COG cache to keep files open
+    local_written = 0
+
     with CogCache() as cog_cache:
-        # Pre-load forecast data for this date
         _log("INFO", f"[bake_corridor_opt] Pre-loading COGs for {date_yyyymmdd}")
         preloaded = _preload_forecast_for_date(date_yyyymmdd, dom, cog_cache)
-        
+
         h24_ok = preloaded.get("h24", {}).get("ok", False)
         h72_ok = preloaded.get("h72", {}).get("ok", False)
         _log("INFO", f"[bake_corridor_opt] Preload complete: h24={h24_ok}, h72={h72_ok}")
-        
-        # Process tiles sequentially (single-threaded)
+
         for i, (hours, z, x, y) in enumerate(jobs):
             try:
-                # Check if already exists
                 p = _tile_cache_path(dom, hours, date_yyyymmdd, z, x, y)
                 if _is_valid_png_file(p):
                     skip += 1
                     continue
-                
-                # Generate tile from pre-loaded COGs
-                png, is_valid = _generate_tile_from_preloaded(z, x, y, hours, preloaded)
-                
-                # Save tile
+
+                png, is_valid = _generate_tile_from_preloaded(
+                    z, x, y, hours, preloaded, cog_cache=cog_cache
+                )
+
                 _tile_cache_put(dom, hours, date_yyyymmdd, z, x, y, png)
                 ok += 1
-                pending_push.append(p)
-                
+                local_written += 1
+
             except Exception as e:
                 if fail < 5:
                     _log("WARN", f"[bake_corridor_opt] tile failed z={z} x={x} y={y}: {e!r}")
                 fail += 1
-            
-            # Incremental push
-            if len(pending_push) >= push_every:
-                result = _incremental_hf_push(pending_push, "tilecache", f"{date_yyyymmdd}_corridor_{total_pushed}")
-                if result.get("ok"):
-                    total_pushed += result.get("pushed", 0)
-                pending_push = []
-            
-            # Progress logging
+
             if (i + 1) % 500 == 0:
-                _log("DEBUG", f"[bake_corridor_opt] {date_yyyymmdd}: {i+1}/{total_jobs} (ok={ok}, skip={skip}, fail={fail}, pushed={total_pushed})")
-        
-        # Final push
-        if pending_push:
-            result = _incremental_hf_push(pending_push, "tilecache", f"{date_yyyymmdd}_corridor_final")
-            if result.get("ok"):
-                total_pushed += result.get("pushed", 0)
-    
-    _log("INFO", f"[bake_corridor_opt] {date_yyyymmdd} complete: ok={ok}, skip={skip}, fail={fail}, pushed={total_pushed}")
-    
+                _log("DEBUG", f"[bake_corridor_opt] {date_yyyymmdd}: {i+1}/{total_jobs} (ok={ok}, skip={skip}, fail={fail})")
+
+    _log("INFO", f"[bake_corridor_opt] {date_yyyymmdd} complete: ok={ok}, skip={skip}, fail={fail}, local_written={local_written}")
+
     return {
         "ok": True,
         "date": date_yyyymmdd,
@@ -4751,13 +5129,9 @@ def _bake_corridor_tiles_for_date_optimized(
         "ok_count": ok,
         "skip_count": skip,
         "fail_count": fail,
-        "pushed_count": total_pushed,
+        "pushed_count": 0,
+        "remote_push": "deferred",
     }
-
-
-# =============================================================================
-# PART 5: Optimized single-threaded RAW tile baking
-# =============================================================================
 
 def _bake_corridor_raw_tiles_for_date_optimized(
     *,
@@ -4771,7 +5145,6 @@ def _bake_corridor_raw_tiles_for_date_optimized(
     max_tiles_total: int,
     push_every: int = 300,
 ) -> dict:
-    """Optimized single-threaded corridor RAW baking."""
     dom = (dom or "zz").lower()
     _log("INFO", f"[bake_corridor_raw_opt] Starting for {date_yyyymmdd}")
 
@@ -4779,225 +5152,229 @@ def _bake_corridor_raw_tiles_for_date_optimized(
     if not tiles:
         return {"ok": False, "error": "no_tiles"}
     tiles = tiles[:int(max_tiles_total)]
-    
+
     jobs = [(int(h), int(z), int(x), int(y)) for h in hours_list for (z, x, y) in tiles]
     total_jobs = len(jobs)
     _log("INFO", f"[bake_corridor_raw_opt] {total_jobs} tiles to process")
-    
+
     ok = 0
     skip = 0
     fail = 0
     pending_push: list[Path] = []
     total_pushed = 0
-    
+
     with CogCache() as cog_cache:
         preloaded = _preload_forecast_for_date(date_yyyymmdd, dom, cog_cache)
-        
+
         for i, (hours, z, x, y) in enumerate(jobs):
             try:
                 p = _raw_tile_cache_path(dom, hours, date_yyyymmdd, z, x, y)
                 if _is_valid_npz_file(p):
                     skip += 1
                     continue
-                
-                # Generate raw tile (NPZ format with actual values)
+
                 raw, _ = _generate_forecast_by_date_raw_impl(
-                    z=z, x=x, y=y,
+                    z=z,
+                    x=x,
+                    y=y,
                     date_yyyymmdd=date_yyyymmdd,
                     hours=hours,
                     dom=dom,
+                    cog_cache=cog_cache,
                 )
+
                 _raw_tile_cache_put(dom, hours, date_yyyymmdd, z, x, y, raw)
                 ok += 1
                 pending_push.append(p)
-                
+
             except Exception as e:
                 if fail < 5:
                     _log("WARN", f"[bake_corridor_raw_opt] tile failed z={z} x={x} y={y}: {e!r}")
                 fail += 1
-            
+
             if len(pending_push) >= push_every:
                 result = _incremental_hf_push(pending_push, "rawtilecache", f"{date_yyyymmdd}_corridor_raw_{total_pushed}")
                 if result.get("ok"):
                     total_pushed += result.get("pushed", 0)
                 pending_push = []
-            
+
             if (i + 1) % 500 == 0:
-                _log("DEBUG", f"[bake_corridor_raw_opt] {date_yyyymmdd}: {i+1}/{total_jobs}")
-        
+                _log("DEBUG", f"[bake_corridor_raw_opt] {date_yyyymmdd}: {i+1}/{total_jobs} (ok={ok}, skip={skip}, fail={fail}, pushed={total_pushed})")
+
         if pending_push:
             result = _incremental_hf_push(pending_push, "rawtilecache", f"{date_yyyymmdd}_corridor_raw_final")
             if result.get("ok"):
                 total_pushed += result.get("pushed", 0)
-    
+
     _log("INFO", f"[bake_corridor_raw_opt] {date_yyyymmdd} complete: ok={ok}, skip={skip}, fail={fail}, pushed={total_pushed}")
-    
-    return {"ok": True, "date": date_yyyymmdd, "ok_count": ok, "skip_count": skip, "fail_count": fail, "pushed_count": total_pushed}
 
-
-def _run_daily_roll_job_impl() -> dict:
-    """
-    Optimized roll job:
-    - Process one date at a time (fully complete before moving on)
-    - Single-threaded baking (no deadlocks)
-    - Incremental push (save progress)
-    - Clear memory between dates
-    """
-    started = datetime.utcnow().isoformat()
-    today_local = datetime.now(LOCAL_TZ).date()
-    window = _rolling_dates_local_window(
-        today_local=today_local,
-        days=int(ROLL_WINDOW_DAYS) if int(ROLL_WINDOW_DAYS) > 0 else 5,
-    )
-
-    _log("INFO", f"[roll] ========== BAKING JOB STARTED ==========")
-    _log("INFO", f"[roll] local_today={today_local.isoformat()} window={window}")
-
-    results = {
+    return {
         "ok": True,
-        "started_utc": started,
-        "window": window,
-        "dates": {},
-        "errors": [],
+        "date": date_yyyymmdd,
+        "ok_count": ok,
+        "skip_count": skip,
+        "fail_count": fail,
+        "pushed_count": total_pushed,
     }
 
-    # Step 1: Pull HF cache
-    _log("INFO", "[roll] Step 1: Pulling HF cache")
-    try:
-        _hf_pull_cache()
-    except Exception as e:
-        _log("WARN", f"[roll] HF pull failed: {e!r}")
+def _run_daily_roll_job_impl() -> dict:
+    if not _try_acquire_run_lock(_ROLL_LOCK_NAME, stale_seconds=_ROLL_LOCK_STALE_SECONDS):
+        _log("INFO", "[roll] skipped: roll job already running (run-lock held)")
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "already_running",
+            "started_utc": datetime.utcnow().isoformat(),
+        }
 
-    # Step 2: Prune old tiles
-    _log("INFO", "[roll] Step 2: Pruning old tiles")
     try:
-        keep_set = set(window)
-        del_tiles = _prune_tile_cache(keep_set, KEEP_TILE_DAYS)
-        del_raw = _prune_raw_tile_cache(keep_set, KEEP_TILE_DAYS)
-        del_cogs = _prune_forecast_cogs(KEEP_FORECAST_COG_DAYS)
-        _log("INFO", f"[roll] Pruned: tiles={del_tiles}, raw_tiles={del_raw}, cogs={del_cogs}")
-    except Exception as e:
-        _log("WARN", f"[roll] Prune failed: {e!r}")
+        started = datetime.utcnow().isoformat()
+        today_local = datetime.now(LOCAL_TZ).date()
+        window = _rolling_dates_local_window(
+            today_local=today_local,
+            days=int(ROLL_WINDOW_DAYS) if int(ROLL_WINDOW_DAYS) > 0 else 5,
+        )
 
-    # Step 3: Build forecast COGs for all dates first
-    _log("INFO", "[roll] Step 3: Building forecast COGs")
-    dates_with_data = []
-    for i, ymd in enumerate(window):
-        _log("INFO", f"[roll] Building COGs for {ymd} ({i+1}/{len(window)})")
+        _log("INFO", f"[roll] ========== BAKING JOB STARTED ==========")
+        _log("INFO", f"[roll] local_today={today_local.isoformat()} window={window}")
+
+        results = {
+            "ok": True,
+            "started_utc": started,
+            "window": window,
+            "dates": {},
+            "errors": [],
+        }
+
+        _log("INFO", "[roll] Step 1: Pulling HF cache")
         try:
-            result = _ensure_forecast_for_valid(_norm_ts(f"{ymd}05"), dom_prefer=WARM_DOM)
-            if result.get("ok"):
-                dates_with_data.append(ymd)
-                _log("INFO", f"[roll] COGs for {ymd}: ok=True, melt72={result.get('melt72_cog', 'N/A')}")
-            else:
-                _log("WARN", f"[roll] COGs for {ymd}: failed - {result}")
+            _hf_pull_cache()
         except Exception as e:
-            _log("WARN", f"[roll] COGs for {ymd} exception: {e!r}")
-    
-    if not dates_with_data:
-        _log("WARN", "[roll] No dates have forecast data!")
-        results["ok"] = False
+            _log("WARN", f"[roll] HF pull failed: {e!r}")
+
+        _log("INFO", "[roll] Step 2: Pruning old tiles")
+        try:
+            keep_set = set(window)
+            del_tiles = _prune_tile_cache(keep_set, KEEP_TILE_DAYS)
+            del_raw = _prune_raw_tile_cache(keep_set, KEEP_TILE_DAYS)
+            del_cogs = _prune_forecast_cogs(KEEP_FORECAST_COG_DAYS)
+            _log("INFO", f"[roll] Pruned: tiles={del_tiles}, raw_tiles={del_raw}, cogs={del_cogs}")
+        except Exception as e:
+            _log("WARN", f"[roll] Prune failed: {e!r}")
+
+        _log("INFO", "[roll] Step 3: Building forecast COGs")
+        dates_with_data = []
+        for i, ymd in enumerate(window):
+            _log("INFO", f"[roll] Building COGs for {ymd} ({i+1}/{len(window)})")
+            try:
+                result = _ensure_forecast_for_valid(_norm_ts(f"{ymd}05"), dom_prefer=WARM_DOM)
+                if result.get("ok"):
+                    dates_with_data.append(ymd)
+                    _log("INFO", f"[roll] COGs for {ymd}: ok=True, melt72={result.get('melt72_cog', 'N/A')}")
+                else:
+                    _log("WARN", f"[roll] COGs for {ymd}: failed - {result}")
+            except Exception as e:
+                _log("WARN", f"[roll] COGs for {ymd} exception: {e!r}")
+
+        if not dates_with_data:
+            _log("WARN", "[roll] No dates have forecast data!")
+            results["ok"] = False
+            return results
+
+        _log("INFO", "[roll] Step 4: Baking tiles")
+        for i, ymd in enumerate(dates_with_data):
+            _log("INFO", f"[roll] Baking tiles for {ymd} ({i+1}/{len(dates_with_data)})")
+            date_results = {"date": ymd}
+
+            _log("INFO", f"[roll] {ymd}: Baking corridor PNG tiles")
+            try:
+                r = _bake_corridor_tiles_for_date_optimized(
+                    date_yyyymmdd=ymd,
+                    dom=WARM_DOM,
+                    hours_list=WARM_HOURS_LIST,
+                    zmin=WARM_ZMIN,
+                    zmax=WARM_ZMAX,
+                    miles=WARM_MILES,
+                    cap_per_zoom=WARM_CAP_PER_ZOOM,
+                    max_tiles_total=WARM_MAX_TILES_TOTAL,
+                    push_every=300,
+                )
+                date_results["corridor_png"] = r
+                _log("INFO", f"[roll] {ymd}: corridor PNG OK={r.get('ok_count', 0)}, FAIL={r.get('fail_count', 0)}")
+            except Exception as e:
+                _log("WARN", f"[roll] {ymd} corridor PNG exception: {e!r}")
+                date_results["corridor_png"] = {"ok": False, "error": repr(e)}
+
+            _log("INFO", f"[roll] {ymd}: Baking corridor RAW tiles")
+            try:
+                r = _bake_corridor_raw_tiles_for_date_optimized(
+                    date_yyyymmdd=ymd,
+                    dom=WARM_DOM,
+                    hours_list=WARM_HOURS_LIST,
+                    zmin=WARM_ZMIN,
+                    zmax=WARM_ZMAX,
+                    miles=WARM_MILES,
+                    cap_per_zoom=WARM_CAP_PER_ZOOM,
+                    max_tiles_total=WARM_MAX_TILES_TOTAL,
+                    push_every=300,
+                )
+                date_results["corridor_raw"] = r
+                _log("INFO", f"[roll] {ymd}: corridor RAW OK={r.get('ok_count', 0)}, FAIL={r.get('fail_count', 0)}")
+            except Exception as e:
+                _log("WARN", f"[roll] {ymd} corridor RAW exception: {e!r}")
+                date_results["corridor_raw"] = {"ok": False, "error": repr(e)}
+
+            _log("INFO", f"[roll] {ymd}: Baking lowres PNG tiles")
+            try:
+                r = _bake_lowres_box_tiles_for_date(
+                    date_yyyymmdd=ymd,
+                    dom=WARM_DOM,
+                    hours_list=WARM_HOURS_LIST,
+                    zmin=LOWRES_BOX_ZMIN,
+                    zmax=LOWRES_BOX_ZMAX,
+                    conc=1,
+                )
+                date_results["lowres_png"] = r
+                _log("INFO", f"[roll] {ymd}: lowres PNG OK={r.get('ok_count', 0)}")
+            except Exception as e:
+                _log("WARN", f"[roll] {ymd} lowres PNG exception: {e!r}")
+
+            _log("INFO", f"[roll] {ymd}: Baking lowres RAW tiles")
+            try:
+                r = _bake_lowres_box_raw_tiles_for_date(
+                    date_yyyymmdd=ymd,
+                    dom=WARM_DOM,
+                    hours_list=WARM_HOURS_LIST,
+                    zmin=LOWRES_BOX_ZMIN,
+                    zmax=LOWRES_BOX_ZMAX,
+                    conc=1,
+                )
+                date_results["lowres_raw"] = r
+                _log("INFO", f"[roll] {ymd} lowres RAW OK={r.get('ok_count', 0)}")
+            except Exception as e:
+                _log("WARN", f"[roll] {ymd} lowres RAW exception: {e!r}")
+
+            results["dates"][ymd] = date_results
+            _log("INFO", f"[roll] ===== Completed {ymd} =====")
+
+            import gc
+            gc.collect()
+
+        _log("INFO", "[roll] Step 5: Final HF operations")
+        try:
+            _hf_prune_remote_and_local(keep_days=max(KEEP_FORECAST_COG_DAYS, KEEP_TILE_DAYS))
+            _hf_flush_pending(f"roll_flush_{today_local.isoformat()}")
+        except Exception as e:
+            _log("WARN", f"[roll] Final HF ops failed: {e!r}")
+
+        results["finished_utc"] = datetime.utcnow().isoformat()
+        _log("INFO", f"[roll] ========== BAKING JOB COMPLETE ==========")
+        _log("INFO", f"[roll] Finished at {results['finished_utc']}")
         return results
 
-    # Step 4: Bake tiles - ONE DATE AT A TIME
-    _log("INFO", "[roll] Step 4: Baking tiles")
-    
-    for i, ymd in enumerate(dates_with_data):
-        _log("INFO", f"[roll] Baking tiles for {ymd} ({i+1}/{len(dates_with_data)})")
-        date_results = {"date": ymd}
-        
-        # 4a: Corridor PNG
-        _log("INFO", f"[roll] {ymd}: Baking corridor PNG tiles")
-        try:
-            r = _bake_corridor_tiles_for_date_optimized(
-                date_yyyymmdd=ymd,
-                dom=WARM_DOM,
-                hours_list=WARM_HOURS_LIST,
-                zmin=WARM_ZMIN,
-                zmax=WARM_ZMAX,
-                miles=WARM_MILES,
-                cap_per_zoom=WARM_CAP_PER_ZOOM,
-                max_tiles_total=WARM_MAX_TILES_TOTAL,
-                push_every=300,
-            )
-            date_results["corridor_png"] = r
-            _log("INFO", f"[roll] {ymd}: corridor PNG OK={r.get('ok_count', 0)}, FAIL={r.get('fail_count', 0)}")
-        except Exception as e:
-            _log("WARN", f"[roll] {ymd} corridor PNG exception: {e!r}")
-            date_results["corridor_png"] = {"ok": False, "error": repr(e)}
-        
-        # 4b: Corridor RAW
-        _log("INFO", f"[roll] {ymd}: Baking corridor RAW tiles")
-        try:
-            r = _bake_corridor_raw_tiles_for_date_optimized(
-                date_yyyymmdd=ymd,
-                dom=WARM_DOM,
-                hours_list=WARM_HOURS_LIST,
-                zmin=WARM_ZMIN,
-                zmax=WARM_ZMAX,
-                miles=WARM_MILES,
-                cap_per_zoom=WARM_CAP_PER_ZOOM,
-                max_tiles_total=WARM_MAX_TILES_TOTAL,
-                push_every=300,
-            )
-            date_results["corridor_raw"] = r
-            _log("INFO", f"[roll] {ymd}: corridor RAW OK={r.get('ok_count', 0)}, FAIL={r.get('fail_count', 0)}")
-        except Exception as e:
-            _log("WARN", f"[roll] {ymd} corridor RAW exception: {e!r}")
-            date_results["corridor_raw"] = {"ok": False, "error": repr(e)}
-        
-        # 4c: Lowres PNG (smaller set, use simple version)
-        _log("INFO", f"[roll] {ymd}: Baking lowres PNG tiles")
-        try:
-            r = _bake_lowres_box_tiles_for_date(
-                date_yyyymmdd=ymd,
-                dom=WARM_DOM,
-                hours_list=WARM_HOURS_LIST,
-                zmin=LOWRES_BOX_ZMIN,
-                zmax=LOWRES_BOX_ZMAX,
-                conc=1,  # Single threaded
-            )
-            date_results["lowres_png"] = r
-            _log("INFO", f"[roll] {ymd}: lowres PNG OK={r.get('ok_count', 0)}")
-        except Exception as e:
-            _log("WARN", f"[roll] {ymd} lowres PNG exception: {e!r}")
-        
-        # 4d: Lowres RAW
-        _log("INFO", f"[roll] {ymd}: Baking lowres RAW tiles")
-        try:
-            r = _bake_lowres_box_raw_tiles_for_date(
-                date_yyyymmdd=ymd,
-                dom=WARM_DOM,
-                hours_list=WARM_HOURS_LIST,
-                zmin=LOWRES_BOX_ZMIN,
-                zmax=LOWRES_BOX_ZMAX,
-                conc=1,
-            )
-            date_results["lowres_raw"] = r
-            _log("INFO", f"[roll] {ymd}: lowres RAW OK={r.get('ok_count', 0)}")
-        except Exception as e:
-            _log("WARN", f"[roll] {ymd} lowres RAW exception: {e!r}")
-        
-        results["dates"][ymd] = date_results
-        _log("INFO", f"[roll] ===== Completed {ymd} =====")
-        
-        # Force garbage collection between dates
-        import gc
-        gc.collect()
+    finally:
+        _release_run_lock(_ROLL_LOCK_NAME)
 
-    # Step 5: Final HF flush
-    _log("INFO", "[roll] Step 5: Final HF operations")
-    try:
-        _hf_prune_remote_and_local(keep_days=max(KEEP_FORECAST_COG_DAYS, KEEP_TILE_DAYS))
-        _hf_flush_pending(f"roll_flush_{today_local.isoformat()}")
-    except Exception as e:
-        _log("WARN", f"[roll] Final HF ops failed: {e!r}")
-
-    results["finished_utc"] = datetime.utcnow().isoformat()
-    _log("INFO", f"[roll] ========== BAKING JOB COMPLETE ==========")
-    _log("INFO", f"[roll] Finished at {results['finished_utc']}")
-    
-    return results
 def _daily_scheduler_loop() -> None:
     time.sleep(0.25)
     _log("INFO", "[scheduler] start")
@@ -5009,10 +5386,15 @@ def _daily_scheduler_loop() -> None:
             _log("INFO", f"[scheduler] next_run_local={nxt.isoformat()} sleep_s={int(sleep_s)}")
             time.sleep(sleep_s)
 
-            _run_daily_roll_job_impl()
+            # Try to start the roll job. If one is already running (boot roll, manual, etc), skip.
+            r = _run_daily_roll_job_impl()
+            if isinstance(r, dict) and r.get("skipped"):
+                _log("INFO", f"[scheduler] roll skipped reason={r.get('reason')}")
+
         except Exception as e:
             _log("INFO", f"[scheduler] crashed err={e!r}")
             time.sleep(30.0)
+
 
 def _preload_forecast_for_date(
     date_yyyymmdd: str,
@@ -5030,37 +5412,51 @@ def _preload_forecast_for_date(
         "h72": {"ok": False},
     }
 
-    # ---- 24h forecast ----
+    # ---- 24h: union COGs (fast path) ----
     try:
         sel = _pick_forecast_for_valid(valid, dom_prefer=dom)
         if sel.get("ok"):
-            melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
+            melt24_union = None
+            snow_union = None
 
-            snow_cogs: list[Path] = []
+            # Ensure 24h union melt exists
+            try:
+                melt24_union = _forecast_melt24h_union_end_cog(sel["valid"], dom_prefer=dom)
+            except Exception as e:
+                _log("WARN", f"[preload] melt24 union failed for {date_yyyymmdd}: {e!r}")
+                melt24_union = None
+
+            # Ensure union snow exists (optional)
             if sel.get("snowpack_urls"):
                 try:
-                    snow_cogs = _build_forecast_snowpack_cogs(sel.get("snowpack_ts") or sel["valid"], sel["snowpack_urls"])
+                    snow_union = _forecast_snowpack_union_end_cog(sel.get("snowpack_ts") or sel["valid"], dom_prefer=dom)
                 except Exception:
-                    snow_cogs = []
+                    snow_union = None
 
-            # Warm the cache (optional but useful to fail fast)
-            for p in melt_cogs:
-                try: cog_cache.get(p)
-                except Exception: pass
-            for p in snow_cogs:
-                try: cog_cache.get(p)
-                except Exception: pass
+            # Warm cache (open once)
+            if melt24_union is not None:
+                try:
+                    cog_cache.get(melt24_union)
+                except Exception:
+                    pass
+            if snow_union is not None:
+                try:
+                    cog_cache.get(snow_union)
+                except Exception:
+                    pass
 
-            result["h24"] = {
-                "ok": True,
-                "sel": sel,
-                "melt_cogs": melt_cogs,
-                "snow_cogs": snow_cogs,
-            }
+            if melt24_union is not None and melt24_union.exists() and melt24_union.stat().st_size > 0:
+                result["h24"] = {
+                    "ok": True,
+                    "run_init": sel["run_init"],
+                    "valid": sel["valid"],
+                    "melt24_union_cog": melt24_union,
+                    "snow_union_cog": snow_union,
+                }
     except Exception as e:
         _log("WARN", f"[preload] h24 failed for {date_yyyymmdd}: {e!r}")
 
-    # ---- 72h forecast ----
+    # ---- 72h: single COG ----
     try:
         run_init = _pick_best_run_init_for_valid_t0024(valid, dom_prefer=dom)
         if run_init:
@@ -5074,41 +5470,57 @@ def _preload_forecast_for_date(
                 result["h72"] = {
                     "ok": True,
                     "run_init": run_init,
+                    "valid": valid,
                     "melt72_cog": melt72_cog,
+                    "snow_union_cog": result["h24"].get("snow_union_cog") if result["h24"].get("ok") else None,
                 }
     except Exception as e:
         _log("WARN", f"[preload] h72 failed for {date_yyyymmdd}: {e!r}")
 
     return result
+
+    
 def _generate_tile_from_preloaded(
     z: int,
     x: int,
     y: int,
     hours: int,
     preloaded: dict,
-    cog_cache: CogCache,
     max_in: float | None = None,
+    *,
+    cog_cache: CogCache | None = None,
 ) -> tuple[bytes, bool]:
-    if int(hours) == 24:
+    if hours == 24:
         h24 = preloaded.get("h24", {})
         if not h24.get("ok"):
             return _transparent_png_256(), False
 
-        melt_mm, melt_valid, _melt_info = _union_tile_cached(
-            h24["melt_cogs"], z, x, y, label="melt", cog_cache=cog_cache
-        )
-        if melt_mm is None or melt_valid is None:
+        melt_cog = h24.get("melt24_union_cog")
+        if not melt_cog:
             return _transparent_png_256(), False
 
+        melt_mm, melt_mask, oob = _tile_arrays_from_cog(
+            melt_cog, z, x, y, cog_cache=cog_cache
+        )
+        if oob or melt_mm is None or melt_mask is None:
+            return _transparent_png_256(), False
+
+        melt_valid = (melt_mask > 0) & np.isfinite(melt_mm) & (melt_mm > -9990.0)
+        melt_mask_u8 = (melt_valid.astype("uint8") * 255)
+
         snow = snow_valid = None
-        if h24.get("snow_cogs"):
-            snow, snow_valid, _snow_info = _union_tile_cached(
-                h24["snow_cogs"], z, x, y, label="snowpack", cog_cache=cog_cache
+        snow_cog = h24.get("snow_union_cog")
+        if snow_cog:
+            snow_arr, snow_mask, oob2 = _tile_arrays_from_cog(
+                snow_cog, z, x, y, cog_cache=cog_cache
             )
+            if (not oob2) and (snow_arr is not None) and (snow_mask is not None):
+                snow_valid = (snow_mask > 0) & np.isfinite(snow_arr) & (snow_arr > -9990.0)
+                snow = snow_arr
 
         png = _melt_to_png(
             melt_mm,
-            (melt_valid.astype("uint8") * 255),
+            melt_mask_u8,
             max_in,
             snow,
             snow_valid,
@@ -5119,30 +5531,50 @@ def _generate_tile_from_preloaded(
         )
         return png, True
 
-    if int(hours) == 72:
+    if hours == 72:
         h72 = preloaded.get("h72", {})
         if not h72.get("ok"):
             return _transparent_png_256(), False
 
-        melt_mm, melt_mask_u8, oob = _tile_arrays_from_cog_cached(
-            h72["melt72_cog"], z, x, y, cog_cache=cog_cache
-        )
-        if oob or melt_mm is None or melt_mask_u8 is None:
+        melt72_cog = h72.get("melt72_cog")
+        if not melt72_cog:
             return _transparent_png_256(), False
 
-        # mimic your union validity semantics for the png mask
-        melt_valid = (melt_mask_u8 > 0) & np.isfinite(melt_mm) & (melt_mm > -9990.0)
+        melt_mm, melt_mask, oob = _tile_arrays_from_cog(
+            melt72_cog, z, x, y, cog_cache=cog_cache
+        )
+        if oob or melt_mm is None or melt_mask is None:
+            return _transparent_png_256(), False
+
+        melt_valid = (melt_mask > 0) & np.isfinite(melt_mm) & (melt_mm > -9990.0)
+        melt_mask_u8 = (melt_valid.astype("uint8") * 255)
+
+        snow = snow_valid = None
+        snow_cog = h72.get("snow_union_cog")
+        if snow_cog:
+            snow_arr, snow_mask, oob2 = _tile_arrays_from_cog(
+                snow_cog, z, x, y, cog_cache=cog_cache
+            )
+            if (not oob2) and (snow_arr is not None) and (snow_mask is not None):
+                snow_valid = (snow_mask > 0) & np.isfinite(snow_arr) & (snow_arr > -9990.0)
+                snow = snow_arr
 
         png = _melt_to_png(
             melt_mm,
-            (melt_valid.astype("uint8") * 255),
+            melt_mask_u8,
             max_in,
-            None,
-            None,
+            snow,
+            snow_valid,
+            snow_allow_min_mm=0.0,
+            snow_underlay_min_mm=0.0001,
+            dilate_px=2,
+            bin_edges_in=BIN_EDGES_72H_IN,
         )
         return png, True
 
     return _transparent_png_256(), False
+
+
 def _generate_forecast_by_date_raw_preloaded(
     *,
     z: int,
@@ -5163,19 +5595,37 @@ def _generate_forecast_by_date_raw_preloaded(
             detail = {"error": "forecast_unavailable", "valid": valid, "dom": dom}
             raise HTTPException(status_code=503, detail=detail)
 
-        sel = h24["sel"]
-        melt_mm, melt_valid, melt_info = _union_tile_cached(
-            h24["melt_cogs"], z, x, y, label="melt", cog_cache=cog_cache
-        )
+        # If your preload still stores 'sel' and domain lists:
+        sel = h24.get("sel") or {}
+
+        # Prefer union COG if present (new preload), else fall back to union-by-domains (old preload)
+        melt_info = "melt_unavailable"
+        if h24.get("melt24_union_cog"):
+            melt_mm, melt_mask, oob = _tile_arrays_from_cog(
+                h24["melt24_union_cog"], z, x, y, cog_cache=cog_cache
+            )
+            if oob or melt_mm is None or melt_mask is None:
+                melt_mm = None
+                melt_valid = None
+                melt_info = f"melt24_union:{h24['melt24_union_cog'].name}"
+            else:
+                melt_valid = (melt_mask > 0) & np.isfinite(melt_mm) & (melt_mm > -9990.0)
+                melt_info = f"melt24_union:{h24['melt24_union_cog'].name}"
+        else:
+            melt_mm, melt_valid, melt_info = _union_tile_cached(
+                h24.get("melt_cogs", []), z, x, y, label="melt", cog_cache=cog_cache
+            )
 
         snow_info = "snowpack_unavailable"
-        if h24.get("snow_cogs"):
-            try:
+        try:
+            if h24.get("snow_union_cog"):
+                snow_info = f"snowpack_union:{h24['snow_union_cog'].name}"
+            elif h24.get("snow_cogs"):
                 _snow, _snow_valid, snow_info = _union_tile_cached(
                     h24["snow_cogs"], z, x, y, label="snowpack", cog_cache=cog_cache
                 )
-            except Exception as e:
-                snow_info = f"snowpack_unavailable:{e!r}"
+        except Exception as e:
+            snow_info = f"snowpack_unavailable:{e!r}"
 
         if melt_mm is None or melt_valid is None:
             raw = _pack_raw_tile_npz(
@@ -5187,8 +5637,8 @@ def _generate_forecast_by_date_raw_preloaded(
                 "X-OOB": "1",
                 "X-Melt-Info": melt_info,
                 "X-SnowMask-Info": snow_info,
-                "X-Forecast-Valid": sel["valid"],
-                "X-Forecast-RunInit-TT": sel["run_init"],
+                "X-Forecast-Valid": sel.get("valid", valid),
+                "X-Forecast-RunInit-TT": sel.get("run_init", ""),
                 "X-Forecast-Hours": "24",
                 "X-Raw-Scale": "10",
             }
@@ -5202,8 +5652,8 @@ def _generate_forecast_by_date_raw_preloaded(
             "X-OOB": "0",
             "X-Melt-Info": melt_info,
             "X-SnowMask-Info": snow_info,
-            "X-Forecast-Valid": sel["valid"],
-            "X-Forecast-RunInit-TT": sel["run_init"],
+            "X-Forecast-Valid": sel.get("valid", valid),
+            "X-Forecast-RunInit-TT": sel.get("run_init", ""),
             "X-Forecast-Hours": "24",
             "X-Raw-Scale": "10",
         }
@@ -5221,7 +5671,7 @@ def _generate_forecast_by_date_raw_preloaded(
             },
         )
 
-    melt_mm, melt_mask_u8, oob = _tile_arrays_from_cog_cached(
+    melt_mm, melt_mask_u8, oob = _tile_arrays_from_cog(
         h72["melt72_cog"], z, x, y, cog_cache=cog_cache
     )
     if oob or melt_mm is None or melt_mask_u8 is None:
@@ -5253,6 +5703,7 @@ def _generate_forecast_by_date_raw_preloaded(
         "X-Raw-Scale": "10",
     }
 
+
 def _shift_ts(ts10: str, hours: int) -> str:
     dt = _ts_to_dt(_norm_ts(ts10)) + timedelta(hours=hours)
     return dt.strftime("%Y%m%d%H")
@@ -5281,6 +5732,7 @@ HTTP_SEM_VALUE = threading.BoundedSemaphore(int(os.environ.get("HTTP_VALUE_MAX_I
 _cpu_set_limits()
 
 @app.get("/forecast/sample_melt")
+@app.get("/forecast/sample_melt")
 def forecast_sample_melt(
     date_yyyymmdd: str = Query(..., regex=r"^\d{8}$"),
     hours: int = Query(24, ge=24, le=72),
@@ -5297,8 +5749,9 @@ def forecast_sample_melt(
     if int(hours) == 72:
         cog = _forecast_melt72h_end_cog(valid, dom_prefer=dom)
         try:
-            with COGReader(cog.as_posix()) as r:
-                data, mask = _cog_point_data_mask(r, lon, lat)
+            r = _cogreader_get(cog)
+            data, mask = _cog_point_data_mask(r, lon, lat)
+
             v = float(np.ravel(data)[0])
             m = int(np.ravel(mask)[0])
 
@@ -5309,18 +5762,52 @@ def forecast_sample_melt(
                 info = "nodata:" + cog.name
         except Exception as e:
             info = f"err:{e!r}"
+
     else:
         sel = _pick_forecast_for_valid(valid, dom_prefer=dom)
         if not sel.get("ok"):
             detail = dict(sel)
             detail["collab_last"] = dict(_COLLAB_LAST)
+            detail["suggestion"] = "forecast data may not be available yet for this date"
             raise HTTPException(status_code=503, detail=detail)
 
-        melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
-        mm, info = _union_point(melt_cogs, lon, lat)
+        try:
+            melt24_union = _forecast_melt24h_union_end_cog(sel["valid"], dom_prefer=dom)
+        except Exception as e:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "melt24_union_cog_unavailable",
+                    "date_yyyymmdd": date_yyyymmdd,
+                    "valid": sel.get("valid", valid),
+                    "dom": dom,
+                    "upstream_error": repr(e),
+                },
+            )
+
+        try:
+            r = _cogreader_get(melt24_union)
+            data, mask = _cog_point_data_mask(r, lon, lat)
+
+            v = float(np.ravel(data)[0])
+            m = int(np.ravel(mask)[0])
+
+            if m > 0 and np.isfinite(v) and v > -9990.0:
+                mm = v
+                info = "ok:" + melt24_union.name
+            else:
+                info = "nodata:" + melt24_union.name
+        except Exception as e:
+            info = f"err:{e!r}"
 
     if mm is None:
-        return {"ok": True, "value_in": None, "info": info, "hours": int(hours), "date_yyyymmdd": date_yyyymmdd}
+        return {
+            "ok": True,
+            "value_in": None,
+            "info": info,
+            "hours": int(hours),
+            "date_yyyymmdd": date_yyyymmdd,
+        }
 
     inches = max(0.0, float(mm) / INCH_TO_MM)
     return {
@@ -5330,19 +5817,29 @@ def forecast_sample_melt(
         "hours": int(hours),
         "date_yyyymmdd": date_yyyymmdd,
     }
-    
+
+
 @app.on_event("startup")
 def _startup() -> None:
     if _acquire_singleton_lock("hf_pull"):
-        try:
-            _hf_pull_cache()
-        except Exception:
-            pass
-        try:
-            _ensure_cn_mbtiles()
-        except Exception as e:
-            _log("WARN", f"[tracks] failed to ensure cn mbtiles: {e!r}")
+        def _background_hf_pull_and_cn():
+            try:
+                _log("INFO", "[startup] background hf_pull_cache starting")
+                _hf_pull_cache()
+                _log("INFO", "[startup] background hf_pull_cache finished")
+            except Exception as e:
+                _log("WARN", f"[startup] background hf_pull_cache failed: {e!r}")
 
+            try:
+                _log("INFO", "[startup] background ensure_cn_mbtiles starting")
+                _ensure_cn_mbtiles()
+                _log("INFO", "[startup] background ensure_cn_mbtiles finished")
+            except Exception as e:
+                _log("WARN", f"[tracks] failed to ensure cn mbtiles (background): {e!r}")
+
+        t_hf = threading.Thread(target=_background_hf_pull_and_cn, daemon=True, name="hf_pull_bg")
+        t_hf.start()
+        _log("INFO", "[startup] hf pull scheduled in background (singleton)")
     else:
         _log("INFO", "[startup] hf pull skipped (another worker holds lock)")
 
@@ -5352,6 +5849,14 @@ def _startup() -> None:
         _log("INFO", "[startup] daily scheduler enabled (singleton)")
     else:
         _log("INFO", "[startup] daily scheduler disabled (another worker holds lock)")
+        
+    if _acquire_singleton_lock("hf_uploader"):
+        t3 = threading.Thread(target=_hf_tiles_uploader_loop, daemon=True)
+        t3.start()
+        _log("INFO", "[startup] hf uploader enabled (singleton)")
+    else:
+        _log("INFO", "[startup] hf uploader disabled (another worker holds lock)")
+
 
     if (str(BOOT_ROLL_DEFAULT).strip() != "0") and _acquire_singleton_lock("boot_roll"):
         t2 = threading.Thread(target=_run_daily_roll_job_impl, daemon=True)
@@ -5380,12 +5885,9 @@ def tiles_24h_latest(z: int, x: int, y: int, max: float | None = Query(None)):
     d = _resolve_latest_nsidc_day()
     if d is None:
         raise HTTPException(status_code=503, detail="No recent NSIDC day available")
-
-    # Optional server-side tile cache for "latest" (short-lived).
-    # We key by resolved day so that when "latest" advances, it naturally becomes a new key.
     if max is None:
         try:
-            hit = _tile_cache_get("nsidc", 24, d, z, x, y)  # dom="nsidc" just namespacing
+            hit = _tile_cache_get("nsidc", 24, d, z, x, y)
             if hit is not None:
                 return _resp_png(
                     hit,
@@ -5461,9 +5963,6 @@ def tiles_forecast_latest(
     days: int = Query(2, ge=2, le=3),
     hours: int = Query(24, ge=24, le=72),
 ):
-    """Serve latest forecast tiles. Fallback chain: HF repo -> local cache -> build on-demand."""
-    
-    # Effective tile resolution
     z_eff, x_eff, y_eff, tier = _effective_request_tile(z, x, y)
     
     if tier == "none":
@@ -5480,12 +5979,9 @@ def tiles_forecast_latest(
         detail["suggestion"] = "latest forecast may not be available yet"
         raise HTTPException(status_code=503, detail=detail)
 
-    valid_ymd = (sel["valid"] or "")[:8]  # YYYYMMDD
-    
-    # Try cache first
+    valid_ymd = (sel["valid"] or "")[:8]
     if max is None and valid_ymd:
         try:
-            # Use a special cache key for "latest" that includes the resolved date
             hit = _tile_cache_get("zz", int(hours), valid_ymd, z_eff, x_eff, y_eff)
             if hit is not None:
                 return _resp_png(
@@ -5503,8 +5999,6 @@ def tiles_forecast_latest(
                 )
         except Exception:
             pass
-
-    # Generate on-demand
     try:
         png, headers = _generate_forecast_by_date_png(
             z=z_eff,
@@ -5540,6 +6034,37 @@ def tiles_forecast_latest(
     except HTTPException as e:
         _log("WARN", f"[tiles] forecast/latest failed: {e.detail}")
         raise
+        
+
+def _is_gzip(data: bytes) -> bool:
+    return len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B
+
+@app.get("/cn_tiles/{z}/{x}/{y}.pbf")
+def cn_tiles(z: int, x: int, y: int):
+    conn = _cn_mbtiles_conn()
+    zmax = _cn_mbtiles_maxzoom()
+
+    z2, x2, y2 = _mbtiles_overzoom(z, x, y, zmax)
+
+    try:
+        data = _mbtiles_get_tile(conn, z2, x2, y2)
+    except Exception as e:
+        _log("WARN", f"[cn_tiles] read fail z={z} x={x} y={y} -> z2={z2} x2={x2} y2={y2} err={e!r}")
+        data = None
+
+    if not data:
+        return Response(status_code=204)
+
+    headers = {
+        "Content-Type": "application/x-protobuf",
+        "Cache-Control": "public, max-age=86400",
+    }
+
+    # Only announce gzip if the tile bytes are actually gzipped
+    if _is_gzip(data):
+        headers["Content-Encoding"] = "gzip"
+
+    return FastResponse(content=data, headers=headers)
 
 @app.get("/value/forecast/by_date")
 def value_forecast_by_date(
@@ -5592,22 +6117,16 @@ def value_forecast_viewport_grid(payload: dict):
                 raise HTTPException(status_code=400, detail="Missing date_yyyymmdd or bounds")
 
             west, south, east, north = [float(b) for b in bounds]
-
-            # sane clamps
             resolution = max(5, min(30, resolution))
             south = max(-85.0, min(85.0, south))
             north = max(-85.0, min(85.0, north))
-
-            # normalize bounds ordering
             if east < west:
                 west, east = east, west
             if north < south:
                 south, north = north, south
 
             valid = _norm_ts(f"{date_yyyymmdd}05")
-
-            # quantize bounds so cache hits survive tiny pans
-            qstep = 0.10  # ~11km at equator; adjust if you want
+            qstep = 0.10
             qw, qs, qe, qn = _q(west, qstep), _q(south, qstep), _q(east, qstep), _q(north, qstep)
 
             cache_key = ("v1", date_yyyymmdd, int(hours), dom, qw, qs, qe, qn, int(resolution))
@@ -5714,94 +6233,181 @@ def tiles_forecast_by_date(
     x: int,
     y: int,
     date_yyyymmdd: str = Query(..., regex=r"^\d{8}$"),
-    hours: int = Query(24, ge=24, le=72),
-    max: float | None = Query(None),
+    hours: int = Query(24),
     dom: str = Query("zz"),
-):
-    """
-    Smart tile endpoint: HF repo → local cache → generate on-demand
-    """
+    max_in: float | None = Query(None),
+    client_id: str | None = Query(None),
+) -> Response:
     dom = (dom or "zz").lower()
+    hours_i = int(hours)
 
-    # Check if tile is allowed by geographic bounds
-    z_eff, x_eff, y_eff, tier = _effective_request_tile(z, x, y)
-    if tier == "none":
+    # If the client has moved to a different date, don't waste CPU generating old-date tiles.
+    if client_id and (not _client_is_active_date(client_id, date_yyyymmdd)):
         return _resp_png(
             _transparent_png_256(),
-            cache_control=CACHE_CONTROL_BY_DATE,
-            **{"X-Route": "forecast-by-date", "X-Allowed": "0"},
+            cache_control="no-store",
+            **{
+                "X-Route": "forecast-by-date",
+                "X-Stale": "1",
+                "X-Date": date_yyyymmdd,
+                "X-Hours": str(hours_i),
+            },
         )
 
-    # STEP 1: Try to get from cache (checks local, then HF repo)
-    if max is None:
-        cached = _tile_cache_get(dom, int(hours), date_yyyymmdd, z, x, y)
+    # Try local cache first
+    try:
+        cached = _tile_cache_get(dom, hours_i, date_yyyymmdd, z, x, y)
         if cached is not None:
             return _resp_png(
                 cached,
-                cache_control=CACHE_CONTROL_BY_DATE,
-                **{
-                    "X-Route": "forecast-by-date",
-                    "X-Allowed": "1",
-                    "X-Cache": "hit",
-                    "X-Source": "cache-or-hf",
-                    "X-Tier": tier,
-                },
+                cache_control="public, max-age=31536000, immutable",
+                **{"X-Route": "forecast-by-date", "X-Cache": "hit"},
             )
+    except Exception:
+        pass
 
-    # STEP 2: Not in cache/HF, generate on-demand
-    _log("INFO", f"[tile] generating on-demand: {date_yyyymmdd} h{hours} z{z} x{x} y{y}")
-    
-    try:
-        png, headers = _generate_forecast_by_date_png(
-            z=z,
-            x=x,
-            y=y,
-            date_yyyymmdd=date_yyyymmdd,
-            hours=hours,
-            dom=dom,
-            max_in=max,
+    _log("INFO", f"[tile] generating on-demand: {date_yyyymmdd} h{hours_i} z{z} x{x} y{y}")
+
+    # Generate (keeps your on-demand build functionality intact)
+    png, headers = _generate_forecast_by_date_png(
+        z=z,
+        x=x,
+        y=y,
+        date_yyyymmdd=date_yyyymmdd,
+        hours=hours_i,
+        dom=dom,
+        max_in=max_in,
+    )
+
+    # Re-check if the client changed date during generation; if so, don't store this tile.
+    if client_id and (not _client_is_active_date(client_id, date_yyyymmdd)):
+        return _resp_png(
+            _transparent_png_256(),
+            cache_control="no-store",
+            **{
+                "X-Route": "forecast-by-date",
+                "X-Stale": "1",
+                "X-Date": date_yyyymmdd,
+                "X-Hours": str(hours_i),
+            },
         )
 
-        # STEP 3: Cache the generated tile
-        if max is None:
-            try:
-                _tile_cache_put(dom, int(hours), date_yyyymmdd, z, x, y, png)
+    # Store to cache (only if it's valid-ish)
+    try:
+        _tile_cache_put(dom, hours_i, date_yyyymmdd, z, x, y, png)
+    except Exception:
+        pass
 
-                # Only push to HF if tile is non-transparent
-                try:
-                    is_blank = (png == _transparent_png_256())
-                except Exception:
-                    is_blank = False
+    # Merge headers from generator
+    extra = dict(headers) if isinstance(headers, dict) else {}
+    extra.setdefault("X-Route", "forecast-by-date")
+    extra.setdefault("X-Cache", "miss")
 
-                if not is_blank:
-                    p = _tile_cache_path(dom, int(hours), date_yyyymmdd, z, x, y)
-                    if p.exists():
-                        _hf_enqueue_files([p])
-                cache_status = "miss-generated-cached"
-            except Exception as e:
-                _log("WARN", f"[tile] cache put failed: {e!r}")
-                cache_status = "miss-generated-only"
+    return _resp_png(
+        png,
+        cache_control="public, max-age=31536000, immutable",
+        **extra,
+    )
 
-        else:
-            cache_status = "miss-generated-nocache-max"
 
-        headers = dict(headers or {})
-        headers.update({
-            "X-Route": "forecast-by-date",
-            "X-Allowed": "1",
-            "X-Cache": cache_status,
-            "X-Source": "generated",
-            "X-Tier": tier,
-        })
 
-        return _resp_png(png, cache_control=CACHE_CONTROL_BY_DATE, **headers)
+@app.get("/tiles/forecast_raw/by_date/{z}/{x}/{y}.npz")
+def tiles_forecast_by_date_raw(
+    z: int,
+    x: int,
+    y: int,
+    date_yyyymmdd: str = Query(..., regex=r"^\d{8}$"),
+    hours: int = Query(24),
+    dom: str = Query("zz"),
+    client_id: str | None = Query(None),
+) -> Response:
+    dom = (dom or "zz").lower()
+    hours_i = int(hours)
 
-    except HTTPException as e:
-        _log("WARN", f"[tile] generation failed {date_yyyymmdd} h{hours} z{z}/{x}/{y}: {e.detail}")
-        raise
-    except Exception as e:
-        _log("ERROR", f"[tile] unexpected error {date_yyyymmdd} h{hours} z{z}/{x}/{y}: {e!r}")
-        raise HTTPException(status_code=500, detail=f"tile_generation_error: {e!r}")
+    # If the client moved to a different date, don't waste CPU generating old-date raw tiles.
+    if client_id and (not _client_is_active_date(client_id, date_yyyymmdd)):
+        raw = _pack_raw_tile_npz(
+            melt_mm=np.zeros((256, 256), dtype="float32"),
+            valid_mask_u8=np.zeros((256, 256), dtype="uint8"),
+        )
+        return Response(
+            content=raw,
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Route": "forecast-raw-by-date",
+                "X-Stale": "1",
+                "X-Date": date_yyyymmdd,
+                "X-Hours": str(hours_i),
+            },
+        )
+
+    # Try local cache first
+    try:
+        cached = _raw_tile_cache_get(dom, hours_i, date_yyyymmdd, z, x, y)
+        if cached is not None:
+            return Response(
+                content=cached,
+                media_type="application/octet-stream",
+                headers={
+                    "Cache-Control": "public, max-age=31536000, immutable",
+                    "X-Route": "forecast-raw-by-date",
+                    "X-Cache": "hit",
+                },
+            )
+    except Exception:
+        pass
+
+    _log("INFO", f"[tile_raw] generating on-demand: {date_yyyymmdd} h{hours_i} z{z} x{x} y{y}")
+
+    # Generate (keeps your on-demand build functionality intact)
+    raw, headers = _generate_forecast_by_date_raw(
+        z=z,
+        x=x,
+        y=y,
+        date_yyyymmdd=date_yyyymmdd,
+        hours=hours_i,
+        dom=dom,
+    )
+
+    # Re-check if the client changed date during generation; if so, don't store this raw tile.
+    if client_id and (not _client_is_active_date(client_id, date_yyyymmdd)):
+        raw2 = _pack_raw_tile_npz(
+            melt_mm=np.zeros((256, 256), dtype="float32"),
+            valid_mask_u8=np.zeros((256, 256), dtype="uint8"),
+        )
+        return Response(
+            content=raw2,
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Route": "forecast-raw-by-date",
+                "X-Stale": "1",
+                "X-Date": date_yyyymmdd,
+                "X-Hours": str(hours_i),
+            },
+        )
+
+    # Store to cache
+    try:
+        _raw_tile_cache_put(dom, hours_i, date_yyyymmdd, z, x, y, raw)
+    except Exception:
+        pass
+
+    extra = dict(headers) if isinstance(headers, dict) else {}
+    h = {
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "X-Route": "forecast-raw-by-date",
+        "X-Cache": "miss",
+    }
+    for k, v in extra.items():
+        try:
+            h[str(k)] = str(v)
+        except Exception:
+            pass
+
+    return Response(content=raw, media_type="application/octet-stream", headers=h)
+
 
 @app.get("/tiles/forecast/{ts_key:regex(\\d{8}(?:[_-]?\\d{2}))}/{z}/{x}/{y}.png")
 def tiles_forecast(
@@ -5849,77 +6455,11 @@ def forecast_latest_ts(dom: str = "zz"):
 def forecast_selection(dom: str = "zz"):
     return forecast_latest_ts(dom=dom)
 
-@app.get("/tiles/forecast/by_date_raw/{z}/{x}/{y}.npz")
-def tiles_forecast_by_date_raw(
-    z: int,
-    x: int,
-    y: int,
-    date_yyyymmdd: str = Query(...),
-    hours: int = Query(24),
-    dom: str = Query("zz"),
-):
-    if not _tile_allowed(z, x, y):
-        raw = _pack_raw_tile_npz(
-            melt_mm=np.zeros((256, 256), dtype="float32"),
-            valid_mask_u8=np.zeros((256, 256), dtype="uint8"),
-        )
-        return Response(
-            content=raw,
-            media_type="application/octet-stream",
-            headers={"Cache-Control": CACHE_CONTROL_BY_DATE, "X-Allowed": "0", "X-Raw-Scale": "10"},
-        )
-
-    ymd = (date_yyyymmdd or "").strip()
-    dom = (dom or "zz").lower()
-    hours = int(hours)
-
-    # 1) Local cache (and HF pull-on-miss inside _raw_tile_cache_get)
-    cached = _raw_tile_cache_get(dom, hours, ymd, int(z), int(x), int(y))
-    if cached is not None:
-        return Response(
-            content=cached,
-            media_type="application/octet-stream",
-            headers={"Cache-Control": CACHE_CONTROL_BY_DATE, "X-Cache": "1", "X-Raw-Scale": "10"},
-        )
-
-    # 2) Generate
-    raw, hdr = _generate_forecast_by_date_raw(
-        z=int(z),
-        x=int(x),
-        y=int(y),
-        date_yyyymmdd=ymd,
-        hours=hours,
-        dom=dom,
-    )
-
-    # 3) Store locally
-    _raw_tile_cache_put(dom, hours, ymd, int(z), int(x), int(y), raw)
-
-    # 4) Enqueue push to HF dataset
-    try:
-        p = _raw_tile_cache_path(dom, hours, ymd, int(z), int(x), int(y))
-        if p.exists():
-            _hf_enqueue_files([p])
-    except Exception:
-        pass
-
-    headers = {"Cache-Control": CACHE_CONTROL_BY_DATE, "X-Cache": "0", "X-Raw-Scale": "10"}
-    try:
-        headers.update({k: str(v) for k, v in (hdr or {}).items()})
-    except Exception:
-        pass
-
-    return Response(content=raw, media_type="application/octet-stream", headers=headers)
-
 
 @app.post("/value/forecast/by_date_batch")
 def value_forecast_by_date_batch(
     payload: dict,
 ):
-    """
-    Batch endpoint for cursor readouts - more efficient than individual requests.
-    Payload: {date_yyyymmdd, hours, dom, pts: [[lon,lat], ...]}
-    """
     with _Mode("value"):
         try:
             date_yyyymmdd = payload.get("date_yyyymmdd")
@@ -6078,7 +6618,7 @@ def __debug_prewarm_cn(
     if not sel.get("ok"):
         return {"ok": False, "error": "forecast_selection_failed", "detail": sel}
     try:
-        return _bake_corridor_tiles_for_date(
+        return _bake_corridor_tiles_for_date_optimized(
             date_yyyymmdd=sel["valid"][:8],
             dom=dom,
             hours_list=[int(hours)],
@@ -6087,8 +6627,9 @@ def __debug_prewarm_cn(
             miles=float(miles),
             cap_per_zoom=int(cap_per_zoom),
             max_tiles_total=int(max_tiles_total),
-            conc=int(os.environ.get("BAKE_CONCURRENCY", "6")),
+           # push_every=300,  # or remove if you disable per-tile pushing
         )
+
     except Exception as e:
         return {"ok": False, "error": f"{e!r}"}
 
@@ -6150,82 +6691,6 @@ def __debug_cache_stats():
     
     return stats
 
-@app.get("/cn_tiles/{z}/{x}/{y}.pbf")
-def cn_tiles(z: int, x: int, y: int):
-    try:
-        conn = _cn_mbtiles_conn()
-        data = _mbtiles_get_tile(conn, z, x, y)
-
-        if data is None:
-            return Response(
-                content=b"",
-                status_code=204,
-                media_type="application/vnd.mapbox-vector-tile",
-                headers={"Cache-Control": "public, max-age=300"},
-            )
-
-        headers = {"Cache-Control": "public, max-age=31536000, immutable"}
-        if len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B:
-            headers["Content-Encoding"] = "gzip"
-
-        return Response(
-            content=data,
-            media_type="application/vnd.mapbox-vector-tile",
-            headers=headers,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"cn_tiles_error: {e!r}")
-        
-@app.get("/cn_bounds")
-def cn_bounds():
-    try:
-        conn = _cn_mbtiles_conn()
-        row = conn.execute("SELECT value FROM metadata WHERE name='bounds'").fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="no_bounds")
-        bounds = str(row["value"]).strip()  # west,south,east,north
-        parts = [float(x) for x in bounds.split(",")]
-        west, south, east, north = parts
-        return {"bounds": [[west, south], [east, north]]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"cn_bounds_error: {e!r}")
-
-@app.get("/__debug/hf_status")
-def __debug_hf_status():
-    tok, repo = _hf_cfg()
-    api = _hf_api()
-    out = {"ok": False, "has_token": bool(tok), "repo": repo, "whoami": None, "repo_files_count": 0, "samples": {}, "local_tilecache_png": 0}
-    if api is None or not repo:
-        out["error"] = "hf_not_configured"
-        return out
-    try:
-        try:
-            out["whoami"] = api.whoami().get("name")
-        except Exception as e:
-            out["whoami"] = f"whoami_err:{e!r}"
-        files = api.list_repo_files(repo_id=repo, repo_type="dataset")
-        out["repo_files_count"] = len(files)
-        want = [
-            # "tilecache/bydate_zz_h24_20260113_z11_353_693.png",
-            # "tilecache/bydate_zz_h72_20260113_z11_353_693.png",
-            # "forecast/fcst_melt72h_end_2026011305_zz_cog.tif",
-            "tilecache/bydate_zz_h24_20260111_z6_4_16.png",
-        ]
-        fset = set(files)
-        out["samples"] = {k: (k in fset) for k in want}
-        try:
-            root = _tile_cache_dir()
-            out["local_tilecache_png"] = sum(1 for p in root.rglob("bydate_*.png"))
-        except Exception as e:
-            out["local_tilecache_png"] = f"err:{e!r}"
-        out["ok"] = True
-        return out
-    except Exception as e:
-        out["error"] = repr(e)
-        return out
-
 @app.get("/__logs")
 def __logs(since_ms: int | None = None, limit: int = 200):
     try:
@@ -6241,103 +6706,24 @@ def __logs(since_ms: int | None = None, limit: int = 200):
             pass
     return {"count": len(rows[-limit:]), "items": rows[-limit:]}
     
+class ActiveDatePayload(BaseModel):
+    client_id: str | None = None
+    date_yyyymmdd: str | None = None
 
-@app.get("/debug/forecast/72h_source")
-def debug_forecast_72h_source(
-    date_yyyymmdd: str = Query(..., regex=r"^\d{8}$"),
-    dom: str = Query("zz"),
-    try_pull: int = Query(0, ge=0, le=1),
-):
-    """
-    Debug: show the exact forecast 72h COG filename/path that SHOULD be used for a date,
-    whether it exists locally, and what HF-relative path would be pulled.
+@app.post("/ui/active_date")
+def ui_active_date(payload: ActiveDatePayload = Body(...)):
+    client_id = (payload.client_id or "").strip()
+    date_yyyymmdd = (payload.date_yyyymmdd or "").strip()
 
-    If try_pull=1, attempts an HF pull for the expected file (no build).
-    """
-    try:
-        # validate date quickly
-        datetime.strptime(date_yyyymmdd, "%Y%m%d")
-    except Exception:
-        raise HTTPException(status_code=400, detail="date_yyyymmdd must be YYYYMMDD")
+    if not client_id:
+        raise HTTPException(status_code=422, detail="client_id required")
+    if not re.match(r"^\d{8}$", date_yyyymmdd):
+        raise HTTPException(status_code=422, detail="date_yyyymmdd must be YYYYMMDD")
 
-    dom = (dom or "zz").lower()
-    valid = _norm_ts(f"{date_yyyymmdd}05")
+    _client_mark_active(client_id, date_yyyymmdd)
+    return {"ok": True, "client_id": client_id, "active_date": date_yyyymmdd}
 
-    # This computes the exact expected filename under CACHE/forecast/
-    expected_path = _forecast_dir() / f"fcst_melt72h_end_{valid}_{dom}_cog.tif"
-    rel = expected_path.relative_to(CACHE).as_posix()
-
-    before = {
-        "exists": expected_path.exists(),
-        "size": (expected_path.stat().st_size if expected_path.exists() else 0),
-    }
-
-    pulled = None
-    pull_err = None
-
-    if int(try_pull) == 1:
-        try:
-            pulled = bool(_hf_try_pull_file(rel))
-        except Exception as e:
-            pulled = False
-            pull_err = repr(e)
-
-    after = {
-        "exists": expected_path.exists(),
-        "size": (expected_path.stat().st_size if expected_path.exists() else 0),
-    }
-
-    # Helpful HF config visibility (doesn't expose token)
-    try:
-        _tok, _repo = _hf_cfg()
-    except Exception:
-        _repo = None
-
-    return {
-        "ok": True,
-        "date_yyyymmdd": date_yyyymmdd,
-        "valid": valid,
-        "dom": dom,
-
-        "expected_filename": expected_path.name,
-        "expected_local_path": str(expected_path),
-        "expected_hf_relative_path": rel,
-
-        "hf_pull_on_miss_enabled": bool(_hf_pull_on_miss_enabled()),
-        "hf_dataset_repo": _repo,
-
-        "local_before": before,
-        "try_pull": bool(int(try_pull)),
-        "hf_pull_returned": pulled,
-        "hf_pull_error": pull_err,
-        "local_after": after,
-    }
-@app.get("/debug/coginfo")
-def debug_coginfo(date_yyyymmdd: str = Query(...), hours: int = Query(24), dom: str = Query("zz")):
-    dom = (dom or "zz").lower()
-    valid = _norm_ts(f"{date_yyyymmdd}05")
-
-    if int(hours) == 24:
-        sel = _pick_forecast_for_valid(valid, dom_prefer=dom)
-        if not sel.get("ok"):
-            raise HTTPException(status_code=503, detail=sel)
-        melt_cogs = _build_forecast_melt_cogs(sel["run_init"], sel["valid"], "t0024", sel["melt_urls"])
-        cog = next((p for p in melt_cogs if _cog_dom(p) == dom), melt_cogs[0])
-    else:
-        cog = _forecast_melt72h_end_cog(valid, dom_prefer=dom)
-
-    import rasterio
-    with rasterio.open(cog) as ds:
-        return {
-            "file": str(cog),
-            "crs": str(ds.crs),
-            "transform": tuple(ds.transform),
-            "bounds": tuple(ds.bounds),
-            "width": ds.width,
-            "height": ds.height,
-            "has_gcps": bool(ds.gcps[0]) if hasattr(ds, "gcps") else False,
-        }
-
+    
 if __name__ == "__main__":
     import uvicorn
 
