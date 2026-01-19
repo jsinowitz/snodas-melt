@@ -1,5 +1,5 @@
 FROM mambaorg/micromamba:1.5.8
-ARG MAMBA_USER=mambauserARG MAMBA_USER=mambauser
+ARG MAMBA_USER=mambauser
 WORKDIR /app
 COPY requirements.txt /app/
 RUN micromamba create -y -n snodas -c conda-forge \
@@ -17,6 +17,7 @@ RUN micromamba run -n snodas pip install -r requirements.txt \
   && micromamba clean --all --yes
 USER root
 COPY server.py /app/
+COPY server_big.py /app/
 COPY web /app/web
 COPY start.sh /app/start.sh
 RUN chmod 0755 /app/start.sh && \
