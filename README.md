@@ -1,1 +1,1 @@
-shows snowmelt data on mapbox
+shows snowmelt data on interactive mapbox
