@@ -748,12 +748,19 @@ waitForMapbox(function() {
   }
 
   async function loadAvailable() {
-    const r = await fetch(`${VALUE_BASE}/forecast/available_days?lookback_days=5`, { cache: "no-store" });
-    if (!r.ok) throw new Error(`forecast/available_days -> HTTP ${r.status}`);
-    const j = await r.json();
-    available = (j && j.available_dates ? j.available_dates : []).slice();
-    return j;
+    try {
+      const r = await fetchWithTimeout(`${VALUE_BASE}/forecast/available_days?lookback_days=5`, { cache: "no-store" }, 2500);
+      if (!r.ok) throw new Error(`forecast/available_days -> HTTP ${r.status}`);
+      const j = await r.json();
+      available = (j && j.available_dates ? j.available_dates : []).slice();
+      return j;
+    } catch (e) {
+      // Fallback: today +/- 2 days (UTC)
+      available = [ymdUtcPlusDays(-2), ymdUtcPlusDays(-1), ymdUtcPlusDays(0), ymdUtcPlusDays(1), ymdUtcPlusDays(2)];
+      return { ok: false, fallback: true, available_dates: available, error: String(e) };
+    }
   }
+
 
   function showCursorReadout(px, py, text) {
     cursorEl.style.left = px + "px";
