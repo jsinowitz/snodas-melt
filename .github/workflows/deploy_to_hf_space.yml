@@ -23,4 +23,4 @@ jobs:
 
           git remote add space https://huggingface.co/spaces/Jsinowitz/snodas-melt || true
 
-          git push --force https://Jsinowitz:${HF_GIT_TOKEN}@huggingface.co/spaces/Jsinowitz/snodas-melt main
+          git push --force https://Jsinowitz:${HF_TOKEN}@huggingface.co/spaces/Jsinowitz/snodas-melt main
