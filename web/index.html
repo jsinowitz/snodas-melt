@@ -133,6 +133,24 @@
     .legend-grid { display: grid; grid-template-columns: 20px 1fr; gap: 6px 10px; }
     .swatch { width: 20px; height: 12px; border-radius: 3px; border: 1px solid rgba(0,0,0,0.12); }
     .legend-label { font-size: 12px; color: #222; }
+    .legend-row {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start; /* keep titles aligned at top */
+      margin-top: 10px;
+    }
+    
+    /* make each legend flexible so they can sit side-by-side */
+    .legend {
+      flex: 1 1 0;
+      min-width: 120px; /* prevent collapsing at tiny widths */
+      max-width: 100%;
+      box-sizing: border-box;
+    }
+    
+    /* keep internal vertical layout within each legend */
+    .legend .legend-title { margin-bottom: 6px; }
+    .legend .legend-grid { grid-template-columns: 20px 1fr; }
 
     .err { margin-top: 8px; font-size: 12px; color: #b00020; display: none; white-space: pre-wrap; }
 
@@ -206,16 +224,41 @@
         <input type="radio" name="hours" id="h72" value="72">
         <label for="h72">72 Hour Snowmelt</label>
       </div>
-
-      <div class="sliderrow">
-        <label for="opacity" style="font-size:13px;">Opacity</label>
-        <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.80" aria-label="Snowmelt layer opacity" />
+        <div class="sliderrow">
+          <label for="opacity" style="font-size:13px;">Opacity</label>
+          <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.80" aria-label="Snowmelt layer opacity" />
         <div id="opv" style="font-size:12px;color:#333;width:40px;text-align:right;" aria-live="polite"></div>
       </div>
+      <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(0,0,0,0.10);">
+        <div class="row">
+          <input type="checkbox" id="qpfToggle">
+          <label for="qpfToggle" style="font-size: 14px;">WPC QPF</label>
+        </div>
+        <div class="row" id="qpfDayRow" style="display: none; margin-left: 20px;">
+          <input type="radio" name="qpfDay" id="qpfDay1" value="1" checked>
+          <label for="qpfDay1">Day 1 (24hr)</label>
+          <input type="radio" name="qpfDay" id="qpfDay2" value="2" style="margin-left: 10px;">
+          <label for="qpfDay2">Day 2 (48hr)</label>
+        </div>
+        <div class="row" id="qpfOpacityRow" style="display: none; margin-left: 20px; margin-top: 5px;">
+          <label for="qpfOpacity" style="font-size:12px;">QPF Opacity</label>
+          <input id="qpfOpacity" type="range" min="0" max="1" step="0.05" value="0.70" style="width: 100px;" />
+        </div>
+    </div>
 
-      <div class="legend">
-        <div class="legend-title" id="legendTitle">Inches of water equivalent</div>
-        <div class="legend-grid" id="legendGrid" role="list"></div>
+
+      <div class="legend-row">
+        <!-- Snowmelt legend (single copy) -->
+        <div class="legend">
+          <div class="legend-title" id="legendTitle">Snowmelt - Inches of water equivalent</div>
+          <div class="legend-grid" id="legendGrid" role="list"></div>
+        </div>
+
+        <!-- QPF Legend - hidden by default; will appear to the right -->
+        <div class="legend" id="qpfLegend" style="display: none; flex-direction: column;">
+          <div class="legend-title">QPF - Inches of Precipitation</div>
+          <div class="legend-grid" id="qpfLegendGrid" role="list"></div>
+        </div>
       </div>
 
       <div class="err" id="err" role="alert"></div>
@@ -268,11 +311,30 @@ waitForMapbox(function() {
   const OPACITY = document.getElementById("opacity");
   const OPV = document.getElementById("opv");
   const cursorEl = document.getElementById("cursorReadout");
+  // Add after your other event listeners
+  document.getElementById("qpfToggle").addEventListener("change", (e) => {
+    const visible = e.target.checked;
+    document.getElementById("qpfDayRow").style.display = visible ? "flex" : "none";
+    toggleQpf(visible, qpfDay);
+  });
+  
+  document.querySelectorAll('input[name="qpfDay"]').forEach(el => {
+    el.addEventListener("change", (e) => {
+      qpfDay = parseInt(e.target.value, 10);
+      if (qpfLayerVisible) toggleQpf(true, qpfDay);
+    });
+  });
+  document.getElementById("qpfOpacity").addEventListener("input", (e) => {
+  const opacity = parseFloat(e.target.value);
+  if (map.getLayer("qpf_wms_layer")) {
+    map.setPaintProperty("qpf_wms_layer", "raster-opacity", opacity);
+  }
+});
   const DOM = "zz";
-  const TRACE_INCHES = 0.02;
-  const MIN_ZOOM_FOR_READOUT = 9;
-  const CURSOR_ZMIN = 9;
-  const PREFETCH_ZMIN = 9;
+  const TRACE_INCHES = 0.01;
+  const MIN_ZOOM_FOR_READOUT = 7;
+  const CURSOR_ZMIN = 7;
+  const PREFETCH_ZMIN = 8;
   let selGen = 0;
   let lastRasterSrcId = null;
   let lastRasterLayerId = null;
@@ -280,6 +342,13 @@ waitForMapbox(function() {
   const INITIAL_BOUNDS = [[-130.359201, 29.915607], [-63.228204, 60.840431]];
   let readoutsEnabled = false, lastKey = "";
   const GRID_RESOLUTION = 12;
+  const READOUT_THROTTLE_MS = 100;      // Minimum ms between readout updates
+  const PREFETCH_THROTTLE_MS = 350;     // Minimum ms between prefetch batches
+  const MAX_CONCURRENT_RAW_FETCHES = 4; // Limit simultaneous raw tile fetches
+  const READOUT_DEBOUNCE_MS = 40;       // Debounce rapid mouse movements
+  const WPC_QPF_WMS_BASE = "https://mapservices.weather.noaa.gov/vector/services/precip/wpc_qpf/MapServer/WMSServer";
+  let qpfLayerVisible = false;
+  let qpfDay = 1;  // 1 or 2
 
   const cfg = window.__SNODAS_CONFIG__ || {};
   window.__SNODAS_CONFIG__ = cfg;
@@ -300,8 +369,103 @@ waitForMapbox(function() {
     }
   })();
   
-  
+  function getQpfWmsUrl(day) {
+    // Layer 1 = Day 1, Layer 2 = Day 2
+    const layer = day === 1 ? "1" : "2";
+    return `${WPC_QPF_WMS_BASE}?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&FORMAT=image/png&TRANSPARENT=true&LAYERS=${layer}&WIDTH=256&HEIGHT=256&CRS=EPSG:3857&STYLES=&BBOX={bbox-epsg-3857}`;
+  }
+  const QPF_LEGEND = {
+    colors: [
+    "#ffffff",
+    "#7fff00",
+    "#00ff00",
+    "#088b00",
+    "#104e8b",
+    "#1e90ff",
+    "#00b2ee",
+    "#00eeee",
+    "#8968cd",
+    "#912cee",
+    "#8b008b",
+    "#8b0000",
+    "#ff0000",
+    "#ee4000",
+    "#ff7f00",
+    "#ce8500",
+    "#ffd700",
+    "#ffff00",
+    "#ffc0b7",
+    ],
+    labels: [
+      "0.01", "0.10", "0.25", "0.50", "0.75",
+      "1.00", "1.25", "1.50", "1.75", "2.00",
+      "2.50", "3.00", "4.00", "5.00", "7.00",
+      "10.00", "15.00", "20.00"
+    ]
+  };
 
+  function renderQpfLegend() {
+    const grid = document.getElementById("qpfLegendGrid");
+    if (!grid) return;
+    grid.innerHTML = "";
+    for (let i = 0; i < QPF_LEGEND.colors.length - 1; i++) {
+      const sw = document.createElement("div");
+      sw.className = "swatch";
+      sw.style.background = QPF_LEGEND.colors[i + 1];  // Skip white
+      sw.setAttribute("role", "listitem");
+      const lb = document.createElement("div");
+      lb.className = "legend-label";
+      lb.textContent = QPF_LEGEND.labels[i] || "";
+      grid.appendChild(sw);
+      grid.appendChild(lb);
+    }
+  }
+  
+  function addQpfLayer() {
+    const srcId = "qpf_wms_src";
+    const layerId = "qpf_wms_layer";
+    
+    // Remove existing if present
+    if (map.getLayer(layerId)) map.removeLayer(layerId);
+    if (map.getSource(srcId)) map.removeSource(srcId);
+    
+    if (!qpfLayerVisible) return;
+    
+    map.addSource(srcId, {
+      type: "raster",
+      tiles: [getQpfWmsUrl(qpfDay)],
+      tileSize: 256,
+      attribution: "QPF: NOAA/NWS Weather Prediction Center"
+    });
+    
+    // Add ON TOP - no second argument means it goes on top of everything
+    map.addLayer({
+      id: layerId,
+      type: "raster",
+      source: srcId,
+      paint: {
+        "raster-opacity": 0.7
+      }
+    });
+    // Note: removed the second argument so it goes on top
+  }
+
+  function toggleQpf(visible, day) {
+    qpfLayerVisible = visible;
+    qpfDay = day || qpfDay;
+    addQpfLayer();
+    
+    // Show/hide QPF legend and opacity slider
+    const qpfLegendEl = document.getElementById("qpfLegend");
+    const qpfOpacityRow = document.getElementById("qpfOpacityRow");
+    if (qpfLegendEl) {
+      qpfLegendEl.style.display = visible ? "flex" : "none";
+      if (visible) renderQpfLegend();
+    }
+    if (qpfOpacityRow) {
+      qpfOpacityRow.style.display = visible ? "flex" : "none";
+    }
+  }
   function fetchWithTimeout(url, opts, ms) {
     const timeoutCtrl = new AbortController();
     const t = setTimeout(() => timeoutCtrl.abort("timeout"), ms);
@@ -359,8 +523,8 @@ waitForMapbox(function() {
 
   function tracksReady() { return !!(map.getLayer(CN_LINE) || map.getLayer(CN_LINE_GLOW)); }
 
-  const TRACK_CORRIDOR_MILES = 8;
-  const TRACK_CORRIDOR_PX_CAP = 90;
+  const TRACK_CORRIDOR_MILES = 20;
+  const TRACK_CORRIDOR_PX_CAP = 200;
   
   function milesToPixels(miles, latDeg, zoom) {
     const meters = miles * 1609.344;
@@ -371,10 +535,14 @@ waitForMapbox(function() {
   }
   
   function nearTrack(point, lngLat) {
+  // At high zoom, tracks may not be rendered - skip this check
+    if (map.getZoom() > 10) return true;
+    
     const layers = [];
     if (map.getLayer(CN_LINE)) layers.push(CN_LINE);
     if (map.getLayer(CN_LINE_GLOW)) layers.push(CN_LINE_GLOW);
-    if (!layers.length) return false;
+    if (!layers.length) return true;  // If no track layers, allow readout everywhere
+    
     const z = map.getZoom();
     const rRaw = milesToPixels(TRACK_CORRIDOR_MILES, lngLat.lat, z);
     const r = Math.max(6, Math.min(TRACK_CORRIDOR_PX_CAP, Math.round(rRaw)));
@@ -471,6 +639,24 @@ waitForMapbox(function() {
 
   function debounce(fn, ms) { let t = 0; return () => { clearTimeout(t); t = setTimeout(fn, ms); }; }
   const prefetchDebounced = debounce(prefetchViewportTiles, 250);
+  function throttle(fn, ms) {
+    let lastCall = 0;
+    let scheduled = null;
+    return function(...args) {
+      const now = Date.now();
+      const remaining = ms - (now - lastCall);
+      if (remaining <= 0) {
+        lastCall = now;
+        fn.apply(this, args);
+      } else if (!scheduled) {
+        scheduled = setTimeout(() => {
+          lastCall = Date.now();
+          scheduled = null;
+          fn.apply(this, args);
+        }, remaining);
+      }
+    };
+  }
 
   map.on("load", () => {
     muteRoads(map);
@@ -771,12 +957,12 @@ waitForMapbox(function() {
   }
 
   // ========== RAW TILE (NPZ) CLIENT-SIDE READOUT ==========
-  const RAW_TILE_ZMAX = 12;
+  const RAW_TILE_ZMAX = 11;
   const RAW_TILE_CACHE_MAX = 300;
 
   let hoverSeq = 0;
   let lastHoverKey = "";
-  const HOVER_PIXEL_EPS = 2;
+  const HOVER_PIXEL_EPS = 0;
 
   let rawTileCache = new Map();
   let rawTileInflight = new Map();
@@ -795,11 +981,11 @@ waitForMapbox(function() {
   }
 
   function rawCacheGet(key) {
+    if (!rawTileCache.has(key)) return undefined;  // Not cached
     const v = rawTileCache.get(key);
-    if (!v) return null;
     rawTileCache.delete(key);
-    rawTileCache.set(key, v);
-    return v;
+    rawTileCache.set(key, v);  // Move to end (LRU)
+    return v;  // May be null (cached "no data")
   }
 
   function rawCachePut(key, val) {
@@ -848,23 +1034,95 @@ waitForMapbox(function() {
   }
 
   function parseNpz(ab) {
+    // Validate fflate is loaded
     if (!window.fflate) throw new Error("fflate missing");
-    const files = window.fflate.unzipSync(new Uint8Array(ab));
+    
+    // Validate we have data
+    if (!ab || ab.byteLength < 4) {
+      console.warn("[parseNpz] Empty or too-small buffer:", ab?.byteLength);
+      return null;
+    }
+    
+    const bytes = new Uint8Array(ab);
+    
+    // Check for ZIP magic bytes (PK\x03\x04) - NPZ files are ZIP files
+    if (bytes[0] !== 0x50 || bytes[1] !== 0x4B || bytes[2] !== 0x03 || bytes[3] !== 0x04) {
+      // Check if this is actually a PNG (browser cache confusion)
+      if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) {
+        console.warn("[parseNpz] Received PNG instead of NPZ - cache/routing issue");
+        return null;
+      }
+      // Check if this is HTML (error page)
+      if (bytes[0] === 0x3C) {  // '<'
+        const text = new TextDecoder().decode(bytes.slice(0, 100));
+        console.warn("[parseNpz] Received HTML instead of NPZ:", text.slice(0, 50));
+        return null;
+      }
+      // Check if gzipped (might need decompression first)
+      if (bytes[0] === 0x1F && bytes[1] === 0x8B) {
+        console.warn("[parseNpz] Received gzipped data - attempting to decompress");
+        try {
+          const decompressed = window.fflate.gunzipSync(bytes);
+          return parseNpz(decompressed.buffer);
+        } catch (e) {
+          console.warn("[parseNpz] Gzip decompression failed:", e);
+          return null;
+        }
+      }
+      console.warn("[parseNpz] Invalid NPZ magic bytes:", 
+        bytes[0].toString(16), bytes[1].toString(16), bytes[2].toString(16), bytes[3].toString(16));
+      return null;
+    }
+    
+    // Now safely attempt to unzip
+    let files;
+    try {
+      files = window.fflate.unzipSync(bytes);
+    } catch (e) {
+      console.warn("[parseNpz] fflate.unzipSync failed:", e.message);
+      return null;  // Return null instead of throwing
+    }
+    
     const qn = Object.keys(files).find(n => /(^|\/)q\.npy$/.test(n));
     const mn = Object.keys(files).find(n => /(^|\/)m\.npy$/.test(n));
     const sn = Object.keys(files).find(n => /(^|\/)s\.npy$/.test(n));
-    if (!qn || !mn) throw new Error("npz missing q.npy or m.npy");
+    
+    if (!qn || !mn) {
+      console.warn("[parseNpz] NPZ missing q.npy or m.npy, found:", Object.keys(files));
+      return null;
+    }
+    
     const qbuf = files[qn];
     const mbuf = files[mn];
-    const qmeta = parseNpy(qbuf);
-    const mmeta = parseNpy(mbuf);
+    
+    let qmeta, mmeta;
+    try {
+      qmeta = parseNpy(qbuf);
+      mmeta = parseNpy(mbuf);
+    } catch (e) {
+      console.warn("[parseNpz] Failed to parse npy headers:", e.message);
+      return null;
+    }
+    
     const qdata = qbuf.slice(qmeta.dataOffset);
     const mdata = mbuf.slice(mmeta.dataOffset);
-    if (qmeta.typeCode !== "u2") throw new Error("q.npy expected uint16");
-    if (mmeta.typeCode !== "u1") throw new Error("m.npy expected uint8");
-    if (qmeta.shape.length !== 2) throw new Error("q.npy not 2D");
+    
+    if (qmeta.typeCode !== "u2") {
+      console.warn("[parseNpz] q.npy expected uint16, got:", qmeta.typeCode);
+      return null;
+    }
+    if (mmeta.typeCode !== "u1") {
+      console.warn("[parseNpz] m.npy expected uint8, got:", mmeta.typeCode);
+      return null;
+    }
+    if (qmeta.shape.length !== 2) {
+      console.warn("[parseNpz] q.npy not 2D:", qmeta.shape);
+      return null;
+    }
+    
     const q = new Uint16Array(qdata.buffer, qdata.byteOffset, qdata.byteLength / 2);
     const m = new Uint8Array(mdata.buffer, mdata.byteOffset, mdata.byteLength);
+    
     let scale = 10;
     if (sn && files[sn]) {
       try {
@@ -873,46 +1131,62 @@ waitForMapbox(function() {
         const sdata = sbuf.slice(smeta.dataOffset);
         const sarr = new Uint8Array(sdata.buffer, sdata.byteOffset, sdata.byteLength);
         if (sarr.length) scale = sarr[0];
-      } catch {}
+      } catch (e) {
+        // Use default scale
+      }
     }
+    
     return { q, m, shape: qmeta.shape, scale };
   }
-
-async function loadRawTile(ymd, hours, z, x, y) {
-  const key = rawCacheKey(ymd, hours, z, x, y);
-  const hit = rawCacheGet(key);
-  if (hit) return hit;
-
-  const infl = rawTileInflight.get(key);
-  if (infl && infl.promise) return infl.promise;
-
-  const controller = new AbortController();
-  const p = (async () => {
-    try {
-      const url = rawTileUrl(z, x, y, ymd, hours);
-      const r = await fetch(url, { cache: "force-cache", signal: controller.signal });
-
-      // ✅ Treat non-200 (including 204) as "no tile"
-      if (!r.ok || r.status !== 200) return null;
-
-      const ab = await r.arrayBuffer();
-
-      // ✅ Guard against empty/partial responses
-      if (!ab || ab.byteLength < 16) return null;
-
-      const tile = parseNpz(ab);
-      rawCachePut(key, tile);
-      return tile;
-    } catch (e) {
-      return null;
-    }
-  })().finally(() => {
-    rawTileInflight.delete(key);
-  });
-
-  rawTileInflight.set(key, { promise: p, controller, ymd, hours });
-  return p;
-}
+  async function loadRawTile(ymd, hours, z, x, y) {
+    const key = rawCacheKey(ymd, hours, z, x, y);
+    const hit = rawCacheGet(key);
+    if (hit !== undefined) return hit;  // Return cached result (including null)
+  
+    const infl = rawTileInflight.get(key);
+    if (infl && infl.promise) return infl.promise;
+  
+    const controller = new AbortController();
+    const p = (async () => {
+      try {
+        const url = rawTileUrl(z, x, y, ymd, hours);
+        const r = await fetch(url, { cache: "force-cache", signal: controller.signal });
+  
+        if (!r.ok || r.status !== 200) {
+          rawCachePut(key, null);
+          return null;
+        }
+        
+        // Check content-type for obvious problems
+        const ct = r.headers.get("content-type") || "";
+        if (ct.includes("text/html") || ct.includes("image/png")) {
+          console.warn("[loadRawTile] Wrong content-type:", ct);
+          rawCachePut(key, null);
+          return null;
+        }
+  
+        const ab = await r.arrayBuffer();
+        if (!ab || ab.byteLength < 16) {
+          rawCachePut(key, null);
+          return null;
+        }
+  
+        const tile = parseNpz(ab);
+        rawCachePut(key, tile);  // Cache result (even if null)
+        return tile;
+      } catch (e) {
+        if (e.name !== 'AbortError') {
+          console.warn("[loadRawTile] Error:", e);
+        }
+        return null;
+      }
+    })().finally(() => {
+      rawTileInflight.delete(key);
+    });
+  
+    rawTileInflight.set(key, { promise: p, controller, ymd, hours });
+    return p;
+  }
 
   function sampleRawTile(tile, px, py) {
     if (!tile || !tile.q || !tile.m || !tile.shape) return null;
@@ -926,33 +1200,41 @@ async function loadRawTile(ymd, hours, z, x, y) {
     return inches;
   }
 
-  const prefetchRawPush = makeQueue(12);
+  const prefetchRawPush = makeQueue(MAX_CONCURRENT_RAW_FETCHES);  // Was 12, now uses constant
   const rawPrefetched = new Set();
-
-  function prefetchViewportRawTiles() {
-    if (map.getZoom() < PREFETCH_ZMIN) return;
+  const prefetchViewportRawTilesImpl = () => {
+    
+    const z = map.getZoom();
+    if (z < PREFETCH_ZMIN) return;
+    if (z > RAW_TILE_ZMAX) return;  // Don't prefetch beyond max zoom
+    
     const ymd = selectedDateYMD();
     if (!ymd) return;
     const hours = getHours();
-    const z = Math.min(RAW_TILE_ZMAX, Math.max(0, Math.floor(map.getZoom())));
+    const effectiveZ = Math.min(RAW_TILE_ZMAX, Math.max(0, Math.floor(z)));
     const b = map.getBounds();
-    const r = tileRangeForBounds(b, z);
-    for (let x = r.xmin; x <= r.xmax; x++) {
-      for (let y = r.ymin; y <= r.ymax; y++) {
-        const u = rawTileUrl(z, x, y, ymd, hours);
+    const r = tileRangeForBounds(b, effectiveZ);
+    
+    // Limit tiles per prefetch batch to avoid overwhelming server
+    const MAX_PREFETCH_BATCH = 16;
+    let count = 0;
+    
+    for (let x = r.xmin; x <= r.xmax && count < MAX_PREFETCH_BATCH; x++) {
+      for (let y = r.ymin; y <= r.ymax && count < MAX_PREFETCH_BATCH; y++) {
+        const u = rawTileUrl(effectiveZ, x, y, ymd, hours);
         if (rawPrefetched.has(u)) continue;
         rawPrefetched.add(u);
+        count++;
         prefetchRawPush(() => {
           if (prefetchRawController.signal.aborted) return;
-          return loadRawTile(ymd, hours, z, x, y);
+          return loadRawTile(ymd, hours, effectiveZ, x, y);
         });
-
       }
     }
-  }
-
-  const prefetchRawDebounced = debounce(prefetchViewportRawTiles, 200);
-
+  };
+  
+  const prefetchViewportRawTiles = throttle(prefetchViewportRawTilesImpl, PREFETCH_THROTTLE_MS);
+  const prefetchRawDebounced = debounce(prefetchViewportRawTiles, 300);  
   async function updateCursorReadout(lngLat, point, seq) {
     if (seq !== hoverSeq) return;
     if (map.getZoom() < CURSOR_ZMIN) { showCursorReadout(point.x, point.y, ""); return; }
@@ -961,7 +1243,10 @@ async function loadRawTile(ymd, hours, z, x, y) {
     const ymd = selectedDateYMD();
     if (!ymd) { showCursorReadout(point.x, point.y, ""); return; }
     const hours = getHours();
-    const z = Math.min(RAW_TILE_ZMAX, Math.max(0, Math.floor(map.getZoom())));
+    
+    // Cap at zoom 11 - this is the max zoom with prebaked raw tiles
+    const z = Math.min(11, Math.max(0, Math.floor(map.getZoom())));
+    
     const max = (1 << z) - 1;
     const tx = clamp(lon2tile(lngLat.lng, z), 0, max);
     const ty = clamp(lat2tile(lngLat.lat, z), 0, max);
@@ -977,7 +1262,6 @@ async function loadRawTile(ymd, hours, z, x, y) {
       showCursorReadout(point.x, point.y, "");
     }
   }
-
   function onSelectionChange() {
     rawPrefetched.clear();
     prefetchViewportRawTiles();
@@ -996,18 +1280,25 @@ async function loadRawTile(ymd, hours, z, x, y) {
     return ok;
   }
 
+  const throttledCursorUpdate = throttle((lngLat, point, seq) => {
+    updateCursorReadout(lngLat, point, seq);
+  }, READOUT_THROTTLE_MS);
+
   map.on("mousemove", (e) => {
     if (cursorEl.style.display !== "none") {
       cursorEl.style.left = e.point.x + "px";
       cursorEl.style.top = e.point.y + "px";
     }
+    
     if (!shouldReadout()) return;
     if (!tracksReady()) return;
+    
     const px = Math.round(e.point.x);
     const py = Math.round(e.point.y);
     const ymd = selectedDateYMD();
     const hours = getHours();
     if (!ymd) return;
+    
     const key = `${ymd}|${hours}|${px}|${py}`;
     if (lastHoverKey) {
       const parts = lastHoverKey.split("|");
@@ -1018,10 +1309,12 @@ async function loadRawTile(ymd, hours, z, x, y) {
       }
     }
     lastHoverKey = key;
+    
     const mySeq = ++hoverSeq;
-    updateCursorReadout(e.lngLat, e.point, mySeq);
+    
+    // Use throttled version instead of direct call
+    throttledCursorUpdate(e.lngLat, e.point, mySeq);
   });
-
   map.on("mouseout", () => {
     showCursorReadout(0, 0, "");
   });
@@ -1039,18 +1332,19 @@ async function loadRawTile(ymd, hours, z, x, y) {
 
   map.on("error", (e) => {
     const err = e.error;
-    if (err && err.message && err.message.includes("404")) {
-      console.warn("Tile not found:", err);
+    const msg = err ? err.message : String(e);
+    
+    // Suppress common tile errors
+    if (msg.includes("404") || 
+        msg.includes("timeout") || 
+        msg.includes("TIMED_OUT") ||
+        msg.includes("Unimplemented type")) {
+      console.warn("Tile error (suppressed):", msg);
       return;
     }
-    // Don't show timeout errors to user - they're expected for some tiles
-    if (err && err.message && (err.message.includes("timeout") || err.message.includes("TIMED_OUT"))) {
-      console.warn("Tile timeout:", err);
-      return;
-    }
-    showErr("Map error:\n" + (err ? err.message : String(e)));
+    
+    showErr("Map error:\n" + msg);
   });
-
   // === MAIN INITIALIZATION - PARALLELIZED ===
   map.on("load", async () => {
     try {
