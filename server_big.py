@@ -1,6 +1,6 @@
 from __future__ import annotations
 import calendar, gzip, io, os, random, re, sys, tarfile, tempfile, threading, time, requests, json, rasterio, rioxarray, math, uuid
-from collections import deque, OrderedDict
+from collections import deque, OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -46,7 +46,7 @@ WARM_CAP_PER_ZOOM = int(os.environ.get("WARM_CAP_PER_ZOOM", "7000"))
 WARM_MAX_TILES_TOTAL = int(os.environ.get("WARM_MAX_TILES_TOTAL", "50000"))
 WARM_DOM = os.environ.get("WARM_DOM", "zz").lower()
 WARM_MILES = float(os.environ.get("WARM_MILES", "8"))
-BOOT_ROLL_DEFAULT = os.environ.get("RUN_BOOT_ROLL", "1") #switch to 1 to run tile fetch on restart, 0 to skip
+BOOT_ROLL_DEFAULT = os.environ.get("RUN_BOOT_ROLL", "0") #switch to 1 to run tile fetch on restart, 0 to skip
 WARM_HOURS_LIST = [24, 72]
 CN_MBTILES_LOCAL = Path("cache") / "tracks" / "cn_tracks.mbtiles"
 CN_MBTILES_REPO_PATH = "tracks/cn_tracks.mbtiles"
@@ -57,8 +57,8 @@ _VIEWGRID_TTL_S = 45.0
 _MELTCOGS_LOCK = threading.Lock()
 _MELTCOGS_CACHE: dict[tuple, tuple[float, Any]] = {}
 _MELTCOGS_TTL_S = 300.0
-KEEP_TILE_DAYS = int(os.environ.get("KEEP_TILE_DAYS", "5"))
-KEEP_FORECAST_COG_DAYS = int(os.environ.get("KEEP_FORECAST_COG_DAYS", "5"))
+KEEP_TILE_DAYS = int(os.environ.get("KEEP_TILE_DAYS", "6"))
+KEEP_FORECAST_COG_DAYS = int(os.environ.get("KEEP_FORECAST_COG_DAYS", "6"))
 _COGREADER_CACHE_MAX = int(os.environ.get("COGREADER_CACHE_MAX", "12"))
 _COGREADER_CACHE: "OrderedDict[str, COGReader]" = OrderedDict()
 _COGREADER_CACHE_LK = threading.Lock()
@@ -205,6 +205,31 @@ def _cogreader_cache_clear() -> None:
             except Exception:
                 pass
         _COGREADER_CACHE.clear()
+        
+# Simple in-memory rate limiter
+_RATE_LIMIT_WINDOW = 10.0  # seconds
+_RATE_LIMIT_MAX_REQUESTS = 50  # max requests per window per client
+_rate_limit_buckets: dict[str, list[float]] = defaultdict(list)
+_rate_limit_lock = threading.Lock()
+
+def _check_rate_limit(client_id: str) -> bool:
+    """Returns True if request is allowed, False if rate limited"""
+    if not client_id:
+        return True  # No client ID = no rate limiting (backwards compat)
+    
+    now = time.time()
+    cutoff = now - _RATE_LIMIT_WINDOW
+    
+    with _rate_limit_lock:
+        # Clean old entries
+        bucket = _rate_limit_buckets[client_id]
+        bucket[:] = [t for t in bucket if t > cutoff]
+        
+        if len(bucket) >= _RATE_LIMIT_MAX_REQUESTS:
+            return False  # Rate limited
+        
+        bucket.append(now)
+        return True
 def _is_valid_png_file(p: Path) -> bool:
     try:
         if not p.exists():
@@ -368,7 +393,16 @@ def _safe_unlink(p: Path) -> None:
         return
     except Exception:
         return
-        
+
+def _validate_npz_bytes(data: bytes) -> bool:
+    """Validate NPZ bytes before serving - checks ZIP magic header"""
+    if not data or len(data) < 16:
+        return False
+    # Check ZIP magic: PK\x03\x04
+    if data[0:4] != b'PK\x03\x04':
+        return False
+    return True
+
 def _tile_cache_put(dom, hours, ymd, z, x, y, png: bytes) -> Path:
     p = _tile_cache_path(dom, hours, ymd, z, x, y)
 
@@ -763,6 +797,7 @@ def _tile_cache_get(dom: str, hours: int, ymd: str, z: int, x: int, y: int) -> b
             _log("WARN", f"[hf_pull] unexpected error for {rel}: {e!r}")
 
     return None
+    
 def _incremental_hf_push(
     tile_paths: list[Path],
     repo_prefix: str,
@@ -1883,7 +1918,7 @@ def _zero_raw_npz_256() -> bytes:
         valid_mask_u8=np.zeros((256, 256), dtype="uint8"),
     )
 
-_REMOTE_KEEP_DAYS = 5
+_REMOTE_KEEP_DAYS = 7
 
 def _hf_cfg() -> tuple[Optional[str], Optional[str]]:
     tok = (os.environ.get("HF_TOKEN") or "").strip()
@@ -4386,8 +4421,12 @@ def _tile_arrays_from_cog(
     x: int,
     y: int,
     *,
-    cog_cache: CogCache,
+    cog_cache: CogCache = None,  # Make it optional with default None
 ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], bool]:
+    # Use global COG_CACHE if none provided
+    if cog_cache is None:
+        cog_cache = COG_CACHE
+    
     if (not cog.exists()) or (cog.stat().st_size <= 0):
         raise HTTPException(status_code=500, detail=f"COG missing: {cog.name}")
 
@@ -5721,7 +5760,6 @@ HTTP_SEM_VALUE = threading.BoundedSemaphore(int(os.environ.get("HTTP_VALUE_MAX_I
 _cpu_set_limits()
 
 @app.get("/forecast/sample_melt")
-@app.get("/forecast/sample_melt")
 def forecast_sample_melt(
     date_yyyymmdd: str = Query(..., regex=r"^\d{8}$"),
     hours: int = Query(24, ge=24, le=72),
@@ -6319,18 +6357,20 @@ def tiles_forecast_by_date_raw(
     dom: str = Query("zz"),
     client_id: str | None = Query(None),
 ) -> Response:
-    dom = (dom or "zz").lower()
-    hours_i = int(hours)
-    if not _tile_allowed(z, x, y):
+    # Rate limit check FIRST (before any expensive operations)
+    if client_id and not _check_rate_limit(client_id):
         return Response(
             content=_zero_raw_npz_256(),
             media_type="application/octet-stream",
             headers={
-                "Cache-Control": "public, max-age=31536000, immutable",
+                "Cache-Control": "no-store",
                 "X-Route": "forecast-raw-by-date",
-                "X-Allowed": "0",
+                "X-Rate-Limited": "1",
+                "Retry-After": "5",
             },
         )
+    dom = (dom or "zz").lower()
+    hours_i = int(hours)
     if client_id and (not _client_is_active_date(client_id, date_yyyymmdd)):
         raw = _pack_raw_tile_npz(
             melt_mm=np.zeros((256, 256), dtype="float32"),
@@ -6350,11 +6390,14 @@ def tiles_forecast_by_date_raw(
     try:
         cached = _raw_tile_cache_get(dom, hours_i, date_yyyymmdd, z, x, y)
         if cached is not None:
-            if not _is_valid_npz_bytes(cached):
+            # ADD THIS VALIDATION CHECK:
+            if not _validate_npz_bytes(cached):
+                _log("WARN", f"[tile_raw] Cached NPZ failed validation: {date_yyyymmdd} z{z} x{x} y{y}")
                 try:
                     _safe_unlink(_raw_tile_cache_path(dom, hours_i, date_yyyymmdd, z, x, y))
                 except Exception:
                     pass
+                # Fall through to regenerate instead of serving bad data
             else:
                 return Response(
                     content=cached,
@@ -6366,7 +6409,7 @@ def tiles_forecast_by_date_raw(
                     },
                 )
     except Exception as e:
-        _log("WARN", f"[tile_raw] cache-read error for {date_yyyymmdd} h{hours_i} z{z} x{x} y{y}: {e!r}")
+        _log("WARN", f"[tile_raw] cache-read error: {e!r}")
 
     _log("INFO", f"[tile_raw] generating on-demand: {date_yyyymmdd} h{hours_i} z{z} x{x} y{y}")
     raw, headers = _generate_forecast_by_date_raw(
@@ -6900,7 +6943,131 @@ def ui_active_date(payload: ActiveDatePayload = Body(...)):
     _client_mark_active(client_id, date_yyyymmdd)
     return {"ok": True, "client_id": client_id, "active_date": date_yyyymmdd}
 
+@app.get("/__debug/purge_bad_npz")
+def __debug_purge_bad_npz(
+    dry_run: bool = Query(True),
+    check_hf_repo: bool = Query(False),
+    min_valid_size: int = Query(100),
+):
+    results = {
+        "ok": True,
+        "dry_run": dry_run,
+        "local_cache": {"path": None, "exists": False, "found": 0, "files": []},
+        "hf_repo": {"enabled": check_hf_repo, "found": 0, "files": []},
+    }
     
+    # 1. Check LOCAL cache
+    raw_cache = CACHE / "rawtilecache"
+    results["local_cache"]["path"] = str(raw_cache)
+    
+    if raw_cache.exists():
+        results["local_cache"]["exists"] = True
+        bad_files = []
+        for p in raw_cache.rglob("*.npz"):
+            try:
+                size = p.stat().st_size
+                if size < min_valid_size:
+                    rel_path = str(p.relative_to(CACHE))
+                    bad_files.append({"path": rel_path, "size": size})
+                    if not dry_run:
+                        p.unlink(missing_ok=True)
+            except Exception as e:
+                bad_files.append({"path": str(p), "error": str(e)})
+        
+        results["local_cache"]["found"] = len(bad_files)
+        results["local_cache"]["files"] = bad_files[:50]  # Limit response
+    
+    # 2. Check HF REPO if requested
+    if check_hf_repo:
+        tok, repo = _hf_cfg()
+        if tok and repo:
+            try:
+                api = HfApi()
+                # List all files in the repo
+                files = api.list_repo_files(repo_id=repo, repo_type="dataset", token=tok)
+                
+                # Filter to rawtilecache npz files
+                npz_files = [f for f in files if f.startswith("rawtilecache/") and f.endswith(".npz")]
+                
+                # Unfortunately, we can't easily get file sizes from list_repo_files
+                # We'd need to use repo_info or download each file to check
+                # For now, just report the count
+                results["hf_repo"]["total_npz_files"] = len(npz_files)
+                results["hf_repo"]["sample_files"] = npz_files[:20]
+                results["hf_repo"]["message"] = (
+                    "To check file sizes in HF repo, you need to use the HuggingFace web UI "
+                    "or download files individually. Consider using: "
+                    "huggingface-cli repo-info Jsinowitz/snodas-snowmelt-cache --repo-type dataset"
+                )
+            except Exception as e:
+                results["hf_repo"]["error"] = str(e)
+        else:
+            results["hf_repo"]["error"] = "HF not configured (missing HF_TOKEN or HF_DATASET_REPO)"
+    
+    # Also check tilecache (PNG files)
+    tile_cache = CACHE / "tilecache"
+    if tile_cache.exists():
+        bad_pngs = []
+        for p in tile_cache.rglob("*.png"):
+            try:
+                size = p.stat().st_size
+                # Valid PNGs should be at least 67 bytes (minimal valid PNG)
+                if size < 67:
+                    rel_path = str(p.relative_to(CACHE))
+                    bad_pngs.append({"path": rel_path, "size": size})
+                    if not dry_run:
+                        p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        
+        if bad_pngs:
+            results["tilecache_png"] = {
+                "found": len(bad_pngs),
+                "files": bad_pngs[:50]
+            }
+    
+    return results
+
+
+@app.get("/__debug/cache_paths")
+def __debug_cache_paths():
+    """Show all cache-related paths and their status"""
+    paths = {
+        "CACHE_ROOT": str(CACHE),
+        "tilecache": str(CACHE / "tilecache"),
+        "rawtilecache": str(CACHE / "rawtilecache"),
+        "forecast": str(CACHE / "forecast"),
+        "tracks": str(CACHE / "tracks"),
+    }
+    
+    status = {}
+    for name, path in paths.items():
+        p = Path(path)
+        if p.exists():
+            if p.is_dir():
+                try:
+                    file_count = sum(1 for _ in p.rglob("*") if _.is_file())
+                    status[name] = {"exists": True, "is_dir": True, "file_count": file_count}
+                except Exception as e:
+                    status[name] = {"exists": True, "is_dir": True, "error": str(e)}
+            else:
+                status[name] = {"exists": True, "is_dir": False, "size": p.stat().st_size}
+        else:
+            status[name] = {"exists": False}
+    
+    # HF repo info
+    tok, repo = _hf_cfg()
+    hf_info = {
+        "configured": bool(tok and repo),
+        "repo": repo,
+        "has_token": bool(tok),
+    }
+    
+    return {
+        "paths": paths,
+        "status": status,
+        "hf_repo": hf_info,
+    }
 if __name__ == "__main__":
     import uvicorn
 
