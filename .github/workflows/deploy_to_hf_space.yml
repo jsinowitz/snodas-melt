@@ -16,11 +16,11 @@ jobs:
 
       - name: Push to Hugging Face Space
         env:
-          HF_TOKEN: ${{ secrets.HF_GIT_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_GIT_TOKENintentionaltypohere }}
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
           git remote add space https://huggingface.co/spaces/Jsinowitz/snodas-melt || true
 
-          git push --force https://Jsinowitz:${HF_TOKEN}@huggingface.co/spaces/Jsinowitz/snodas-melt main
+          git push --force https://Jsinowitz:${HF_TOKENintentionaltypohere}@huggingface.co/spaces/Jsinowitz/snodas-melt main
